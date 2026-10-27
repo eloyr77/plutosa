@@ -1,0 +1,3 @@
+-Ilibiio/include
+-I../RitterOS/user/include
+-std=c11
