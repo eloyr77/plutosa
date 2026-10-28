@@ -1,16 +1,17 @@
 /*
  * plutosa: a spectrum analyzer for the ADALM-Pluto on RitterOS.
  *
- * Step 2: samples. A thread connects to the Pluto's iiod (libiio's network
- * backend, ip:192.168.2.1 by default), reads what the receiver is set to,
- * then reads blocks of I/Q samples from cf-ad9361-lpc one after another and
- * measures them: how many blocks arrive, the signal's power and peak, its
- * DC offset. The link cannot carry every sample at the Pluto's rates, so a
- * block is BLOCK contiguous samples and the samples between blocks are
- * lost: what a spectrum needs (one block per FFT). When the link fails, the
- * window says so and the thread connects again. What the window shows is
- * also printed on standard output every few seconds (`make run` brings it
- * back).
+ * A thread connects to the Pluto's iiod (libiio's network backend,
+ * ip:192.168.2.1 by default), reads what the receiver is set to, then reads
+ * blocks of I/Q samples from cf-ad9361-lpc one after another. The link
+ * cannot carry every sample at the Pluto's rates, so a block is BLOCK
+ * contiguous samples and the samples between blocks are lost: what a
+ * spectrum needs. Step 2 measures the blocks (how many arrive, power, peak,
+ * DC offset); step 3 makes each block into FFT frames (dsp.c) and shows the
+ * averaged spectrum's noise floor and strongest peaks. Keys: f the FFT size,
+ * w the window, a the averaging, r reset. When the link fails, the window
+ * says so and the thread connects again. What the window shows is also
+ * printed on standard output every few seconds (`make run` brings it back).
  */
 #include <errno.h>
 #include <math.h>
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "dsp.h"
 #include "iio.h"
 #include "ritteros.h"
 #include "window.h"
@@ -33,7 +35,13 @@ PROGRAM_HELP("plutosa [URI]", "spectrum analyzer for the ADALM-Pluto (URI: ip:19
 #define SHOW_S      0.25            /* the measurements are redrawn this often */
 #define PRINT_S     5.0             /* and printed this often */
 #define RETRY_S     2               /* a failed connection is tried again after this */
-#define LINES       8
+#define LINES       10
+#define PEAKS       5
+
+/* What the keys choose from. */
+static const int FFT_SIZES[] = { 1024, 4096, 16384 };
+static const int AVERAGES[] = { 1, 4, 16, 64 };
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 static struct window *win;
 static uint32_t bg, fg, dim, accent, bad;
@@ -49,6 +57,14 @@ static char radio[LINES][96];       /* the receiver's settings */
 static int nradio;
 static char stats[LINES][96];       /* the samples' measurements */
 static int nstats;
+static char specs[LINES][96];       /* the spectrum's */
+static int nspecs;
+
+/* The spectrum's settings, the keys' (under the lock): the acquisition
+ * thread makes a new spectrum when `changed` moves on. */
+static int fft_choice = 1, average_choice = 2;
+static enum taper taper = TAPER_BLACKMAN_HARRIS;
+static unsigned changed;
 
 static void draw_locked(void)
 {
@@ -66,6 +82,13 @@ static void draw_locked(void)
     y += 10;
     for (int i = 0; i < nstats; i++, y += 18)
         window_text(win, 16, y, stats[i], fg, WINDOW_TRANSPARENT);
+    y += 6;
+    window_fill(win, 16, y, w > 32 ? w - 32 : 0, 1, dim);
+    y += 10;
+    for (int i = 0; i < nspecs; i++, y += 18)
+        window_text(win, 16, y, specs[i], fg, WINDOW_TRANSPARENT);
+    window_text(win, 16, h - 26, "keys: f FFT size, w window, a averaging, r reset", dim,
+                WINDOW_TRANSPARENT);
     window_flush(win);
 }
 
@@ -127,10 +150,15 @@ static double read_double(struct iio_channel *ch, const char *attr)
     return v;
 }
 
-/* The receiver's settings into the window's first list; its sample rate
- * (0 if unknown). They live on the AD936x's control device: the RX LO is
- * output channel altvoltage0, the rest input channel voltage0. */
-static double show_radio(struct iio_context *ctx)
+/* What the spectrum needs to know of the receiver: 0 where unknown. */
+struct tuning {
+    double lo, rate;                    /* Hz, samples per second */
+};
+
+/* The receiver's settings into the window's first list. They live on the
+ * AD936x's control device: the RX LO is output channel altvoltage0, the
+ * rest input channel voltage0. */
+static struct tuning show_radio(struct iio_context *ctx)
 {
     struct iio_device *phy = iio_context_find_device(ctx, "ad9361-phy");
     struct iio_channel *lo = phy ? iio_device_find_channel(phy, "altvoltage0", true) : 0;
@@ -138,14 +166,14 @@ static double show_radio(struct iio_context *ctx)
     char mode[32] = "?";
     if (rx)
         iio_channel_attr_read(rx, "gain_control_mode", mode, sizeof(mode));
-    double rate = read_double(rx, "sampling_frequency");
+    struct tuning tu = { read_double(lo, "frequency"), read_double(rx, "sampling_frequency") };
     pthread_mutex_lock(&lock);
-    nradio = nstats = 0;
+    nradio = nstats = nspecs = 0;
     if (!phy) {
         add_line(radio, &nradio, "no ad9361-phy: not a Pluto?");
     } else {
-        add_line(radio, &nradio, "RX LO        %.6f MHz", read_double(lo, "frequency") / 1e6);
-        add_line(radio, &nradio, "sample rate  %.6f MSPS", rate / 1e6);
+        add_line(radio, &nradio, "RX LO        %.6f MHz", tu.lo / 1e6);
+        add_line(radio, &nradio, "sample rate  %.6f MSPS", tu.rate / 1e6);
         add_line(radio, &nradio, "RF bandwidth %.6f MHz", read_double(rx, "rf_bandwidth") / 1e6);
         add_line(radio, &nradio, "gain         %.0f dB (%s)", read_double(rx, "hardwaregain"), mode);
     }
@@ -153,29 +181,29 @@ static double show_radio(struct iio_context *ctx)
         printf("plutosa: %s\n", radio[i]);
     draw_locked();
     pthread_mutex_unlock(&lock);
-    return rate > 0 ? rate : 0;
+    if (tu.lo < 0)
+        tu.lo = 0;
+    if (tu.rate < 0)
+        tu.rate = 0;
+    return tu;
 }
 
 /* The measurements of one interval: every sample of the blocks that came. */
 struct tally {
     double start;
-    long blocks, samples;
+    long blocks, samples, frames;
     double sum_i, sum_q, sum_power;     /* I, Q and I^2 + Q^2, in full scales */
     int peak;                           /* the largest |I| or |Q| */
 };
 
-static double dbfs(double power)
-{
-    return power > 0 ? 10 * log10(power) : -INFINITY;
-}
-
 /* The interval's measurements into the window's second list. 0 dBFS is a
  * full-scale complex tone (I^2 + Q^2 = 1); the peak is the largest single
  * I or Q against full scale. */
-static void show_tally(const struct tally *t, double now, double rate, int print)
+static void show_tally(const struct tally *t, const struct spectrum *sp, struct tuning tu,
+                       double now, int print)
 {
-    double secs = now - t->start, n = (double)t->samples;
-    double got = n / secs;
+    double secs = now - t->start, samples = (double)t->samples;
+    double got = samples / secs, rate = tu.rate;
     pthread_mutex_lock(&lock);
     nstats = 0;
     add_line(stats, &nstats, "blocks       %.1f/s of %d samples", (double)t->blocks / secs, BLOCK);
@@ -184,19 +212,66 @@ static void show_tally(const struct tally *t, double now, double rate, int print
                  100 * got / rate);
     else
         add_line(stats, &nstats, "received     %.3f MS/s", got / 1e6);
-    add_line(stats, &nstats, "power        %.1f dBFS, peak %.1f dBFS", dbfs(t->sum_power / n),
+    add_line(stats, &nstats, "power        %.1f dBFS, peak %.1f dBFS", power_db(t->sum_power / samples),
              20 * log10(t->peak / FULL_SCALE));
     add_line(stats, &nstats, "DC offset    I %+.2f%%  Q %+.2f%% of full scale",
-             100 * t->sum_i / n, 100 * t->sum_q / n);
-    if (print)
+             100 * t->sum_i / samples, 100 * t->sum_q / samples);
+
+    /* The spectrum: its settings, the noise floor (the median bin) and the
+     * strongest peaks of the average, at least two noise bandwidths apart
+     * (a window's main lobe is about that wide). */
+    nspecs = 0;
+    int n = sp->n;
+    double rbw = tu.rate * sp->enbw / n;
+    add_line(specs, &nspecs, "FFT          %d points, %s, RBW %.2f kHz", n, taper_name(sp->taper),
+             rbw / 1e3);
+    add_line(specs, &nspecs, "average      %ld of %d frames (%.0f frames/s)",
+             sp->frames < sp->averages ? sp->frames : sp->averages, sp->averages,
+             (double)t->frames / secs);
+    add_line(specs, &nspecs, "noise floor  %.1f dBFS per bin", power_db(spectrum_floor(sp->average, n)));
+    int bins[PEAKS];
+    int count = spectrum_peaks(sp->average, n, (int)ceil(2 * sp->enbw), bins, PEAKS);
+    add_line(specs, &nspecs, "peaks        MHz            average   max hold");
+    for (int k = 0; k < count; k++) {
+        int j = bins[k];
+        add_line(specs, &nspecs, "             %-14.6f %5.1f dBFS %5.1f dBFS",
+                 (tu.lo + (double)(j - n / 2) * tu.rate / n) / 1e6, power_db(sp->average[j]),
+                 power_db(sp->hold[j]));
+    }
+    if (print) {
         for (int i = 0; i < nstats; i++)
             printf("plutosa: %s\n", stats[i]);
+        for (int i = 0; i < nspecs; i++)
+            printf("plutosa: %s\n", specs[i]);
+    }
     draw_locked();
     pthread_mutex_unlock(&lock);
 }
 
+/* The spectrum the keys chose: a new one when they changed (or 0, out of
+ * memory: the old one stays). */
+static struct spectrum *chosen_spectrum(struct spectrum *old, unsigned *seen)
+{
+    pthread_mutex_lock(&lock);
+    int n = FFT_SIZES[fft_choice], averages = AVERAGES[average_choice];
+    enum taper t = taper;
+    unsigned now = changed;
+    pthread_mutex_unlock(&lock);
+    if (old && now == *seen)
+        return old;
+    struct spectrum *s = spectrum_new(n, t, averages);
+    if (!s)
+        return old;
+    spectrum_free(old);
+    *seen = now;
+    return s;
+}
+
+/* A block's samples in full scales, for the FFT. */
+static float block_i[BLOCK], block_q[BLOCK];
+
 /* Reads blocks until the link fails: the error. */
-static int stream(struct iio_context *ctx, double rate)
+static int stream(struct iio_context *ctx, struct tuning tu)
 {
     struct iio_device *dev = iio_context_find_device(ctx, "cf-ad9361-lpc");
     struct iio_channel *ich = dev ? iio_device_find_channel(dev, "voltage0", false) : 0;
@@ -212,12 +287,19 @@ static int stream(struct iio_context *ctx, double rate)
         return -errno;
     set_status(0, "receiving: %s", iio_context_get_description(ctx));
 
+    unsigned seen = 0;
+    struct spectrum *sp = chosen_spectrum(0, &seen);
+    if (!sp) {
+        iio_buffer_destroy(buf);
+        return -ENOMEM;
+    }
     struct tally t = { .start = now_s() };
     double printed = t.start;
     for (;;) {
         ssize_t n = iio_buffer_refill(buf);
         if (n < 0) {
             iio_buffer_destroy(buf);
+            spectrum_free(sp);
             return (int)n;
         }
         /* The samples are le:S12/16: already sign-extended, so a plain
@@ -225,9 +307,12 @@ static int stream(struct iio_context *ctx, double rate)
         ptrdiff_t step = iio_buffer_step(buf);
         const char *pi = iio_buffer_first(buf, ich), *pq = iio_buffer_first(buf, qch);
         const char *end = iio_buffer_end(buf);
-        for (; pi < end && pq < end; pi += step, pq += step) {
+        int got = 0;
+        for (; pi < end && pq < end && got < BLOCK; pi += step, pq += step, got++) {
             int i = *(const int16_t *)pi, q = *(const int16_t *)pq;
             double fi = i / FULL_SCALE, fq = q / FULL_SCALE;
+            block_i[got] = (float)fi;
+            block_q[got] = (float)fq;
             t.sum_i += fi;
             t.sum_q += fq;
             t.sum_power += fi * fi + fq * fq;
@@ -239,10 +324,13 @@ static int stream(struct iio_context *ctx, double rate)
             t.samples++;
         }
         t.blocks++;
+        sp = chosen_spectrum(sp, &seen);
+        for (int f = 0; f + sp->n <= got; f += sp->n, t.frames++)
+            spectrum_add(sp, block_i + f, block_q + f);
         double now = now_s();
         if (now - t.start >= SHOW_S) {
             int print = now - printed >= PRINT_S;
-            show_tally(&t, now, rate, print);
+            show_tally(&t, sp, tu, now, print);
             if (print)
                 printed = now;
             t = (struct tally){ .start = now };
@@ -261,8 +349,8 @@ static void *acquire_thread(void *arg)
             sleep(RETRY_S);
             continue;
         }
-        double rate = show_radio(ctx);
-        int err = stream(ctx, rate);
+        struct tuning tu = show_radio(ctx);
+        int err = stream(ctx, tu);
         set_status(1, "link lost: %s (connecting again in %d s)", errtext(-err), RETRY_S);
         iio_context_destroy(ctx);
         sleep(RETRY_S);
@@ -273,7 +361,7 @@ static void *acquire_thread(void *arg)
 int main(int argc, char **argv)
 {
     uri = argc > 1 ? argv[1] : DEFAULT_URI;
-    win = window_open(560, 300, "plutosa");
+    win = window_open(600, 470, "plutosa");
     if (!win) {
         printf("plutosa: cannot open a window (is windowd running?)\n");
         return 1;
@@ -295,7 +383,20 @@ int main(int argc, char **argv)
 
     struct window_event ev;
     while (window_wait(win, &ev) && ev.type != WINDOW_CLOSED) {
-        if (ev.type == WINDOW_RESIZE) {
+        if (ev.type == WINDOW_KEY) {
+            /* A new spectrum from the next block on (reset: the same
+             * settings, made again). */
+            pthread_mutex_lock(&lock);
+            if (ev.key == 'f')
+                fft_choice = (fft_choice + 1) % COUNT(FFT_SIZES);
+            else if (ev.key == 'w')
+                taper = (taper + 1) % TAPERS;
+            else if (ev.key == 'a')
+                average_choice = (average_choice + 1) % COUNT(AVERAGES);
+            if (ev.key == 'f' || ev.key == 'w' || ev.key == 'a' || ev.key == 'r')
+                changed++;
+            pthread_mutex_unlock(&lock);
+        } else if (ev.type == WINDOW_RESIZE) {
             pthread_mutex_lock(&lock);
             if (window_resize(win, ev.x, ev.y) == 0)    /* the new pixels are blank */
                 draw_locked();

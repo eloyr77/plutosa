@@ -23,7 +23,9 @@ xf - -C .sdk`.
 
 | Path | What |
 |---|---|
-| `src/plutosa.c` | the app |
+| `src/plutosa.c` | the app: the window, the acquisition thread, the keys |
+| `src/dsp.c`, `src/dsp.h` | the spectrum's arithmetic (FFT, windows, dBFS, average, max hold, peaks, floor): plain C, no RitterOS calls |
+| `tests/dsptest.c` | dsp.c against DFT and published window values: `make check` (the Mac), `make check-machine` (RitterOS's cc) |
 | `libiio/` | git submodule: eloyr77/ritteros-libiio (libiio 0.26's interface, iiod's network backend only); its sources are compiled into the program (`Makefile`'s `LIBIIO`) |
 | `compile_flags.txt` | include paths for the editor's clangd only (`.sdk/include`; the build is the machine's) |
 | `reports/` | findings handed to other projects (e.g. the NCM link report for RitterOS's kernel) |
@@ -43,7 +45,7 @@ xf - -C .sdk`.
 
 1. Skeleton: window + connection thread, the receiver's settings shown (done; works on the laptop with the real Pluto, 2026-10-27).
 2. Samples: an acquisition thread reading I/Q from `cf-ad9361-lpc` (voltage0/1, `le:S12/16`) in contiguous blocks of 16384, measured (blocks/s, MS/s received, power and peak dBFS, DC offset), reconnecting after a failure (done 2026-10-27: 30-120 blocks/s, 0.3-2.4 MS/s of the Pluto's 30.72 MSPS; 150 s without a loss).
-3. DSP: our own FFT, windows (Hann, Blackman-Harris, flat-top), dBFS, averaging, max hold.
+3. DSP: our own FFT, windows (Hann, Blackman-Harris, flat-top), dBFS, averaging, max hold (done 2026-10-27, not yet checked against a known signal: 30 checks pass on the Mac and on the laptop, each proven by a planted bug; on the Pluto 240-410 frames/s of 4096 points; keys f/w/a/r).
 4. Display: spectrum trace, waterfall, axes, peak marker (`window_blit` of native pixels).
 5. Controls: center frequency, span, RF bandwidth, gain/AGC, reference level.
 Later: spans below 2.084 MSPS (software decimation; Tezuka v0.3.21 rejects FIR configs), offset tuning, FM audio to `/dev/pcm0`.
@@ -67,5 +69,10 @@ fixed since (step 2 streamed 150 s without a loss). Whatever the link
 does, a stall must not garble values (libiio drops and reopens a
 connection after a failed exchange) and the app survives a dead link (it
 shows it and connects again every 2 s).
+**Writing to the Pluto:** only what the app's own controls set. Anything
+else (debug attributes, test tones, anything on the TX side) only with the
+user's OK and after checking its meaning in ADI's driver: `bist_tone` mode
+1 injects into *TX* (2 is RX), and was once written by mistake.
+
 Check before blaming the app: RitterOS `net` (eth1's received/sent), and
 the Pluto's `ifconfig usb0` over `/dev/usbserial0` (login root/analog).

@@ -8,6 +8,8 @@
 #   make run HOST=... [ARGS=URI]     run it there (windowd must be running);
 #                                    another Pluto than ip:192.168.2.1 with ARGS
 #   make stop HOST=...               end it there
+#   make check                       the spectrum's arithmetic (src/dsp.c) tested here
+#   make check-machine HOST=...      the same test built and run on the machine
 #
 # HOST and SSH_OPTS (e.g. SSH_OPTS="-i ~/.ssh/ritteros") can also be set in
 # the environment. libiio comes from the submodule libiio/
@@ -16,7 +18,7 @@
 APP      := plutosa
 KIND     := apps
 LIBIIO   := libiio/src/iio.c libiio/src/iioxml.c libiio/src/iionet.c
-SRCS     := src/plutosa.c $(LIBIIO)
+SRCS     := src/plutosa.c src/dsp.c $(LIBIIO)
 CFLAGS   += -Werror -Ilibiio/include
 
 ifeq ($(wildcard libiio/include/iio.h),)
@@ -26,10 +28,19 @@ endif
 ifneq ($(wildcard /system/sdk/ritteros.mk),)
 # On the RitterOS machine.
 include /system/sdk/ritteros.mk
+
+# The spectrum's test, built with the machine's cc and C library.
+build/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
+	@mkdir -p build
+	cc -Werror -Isrc -o $@ tests/dsptest.c src/dsp.c
+
+.PHONY: check
+check: build/dsptest
+	build/dsptest
 else
 # On another computer: only the app's code goes over, and make runs there.
 REMOTE_DIR ?= /home/root/plutosa
-CODE := Makefile src libiio/include libiio/src
+CODE := Makefile src tests libiio/include libiio/src
 SSH  := ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(SSH_OPTS)
 need_host = $(if $(HOST),,$(error set HOST=user@address, e.g. make $@ HOST=root@192.168.0.195))
 
@@ -60,4 +71,18 @@ stop:
 clean:
 	$(need_host)
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make clean'
+
+# The spectrum's arithmetic (src/dsp.c, plain C) checked here, on this
+# computer, with its own compiler and sanitizers: no machine needed.
+HOST_CC := cc -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror
+build/host/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -Isrc -o $@ tests/dsptest.c src/dsp.c -lm
+
+.PHONY: check check-machine
+check: build/host/dsptest
+	build/host/dsptest
+
+check-machine: push
+	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make check'
 endif
