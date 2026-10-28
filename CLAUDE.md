@@ -1,9 +1,23 @@
 # CLAUDE.md
 
 `plutosa`: a spectrum analyzer for the ADALM-Pluto, a windowed RitterOS app
-(runs under windowd, installed in `/system/<arch>/apps`). Built with
-RitterOS's SDK: read `../RitterOS/sdk/CLAUDE.md` first (toolchain, `make
-deploy run HOST=...`, what RitterOS's C library and `window.h` offer).
+(runs under windowd, installed in `/system/<arch>/apps`).
+
+## Building: on the RitterOS machine, never here
+
+The user's rules: only this app's code is ours. Never read, build in or
+use the local `~/ClaudeProjects/RitterOS` (the OS's own working tree) or
+anything of the kernel and drivers. The SDK is read from GitHub
+(`gh api repos/eloyr77/RitterOS/contents/sdk/CLAUDE.md -H "Accept:
+application/vnd.github.raw"`, likewise `sdk/API.md`, `sdk/ritteros.mk`),
+and the app is built on the machine with its own `cc` and
+`/system/sdk/ritteros.mk` (the SDK's "Building on the machine"). From the
+Mac, `make`, `make deploy`, `make run`, `make stop` copy only the app's code
+(`Makefile`, `src/`, `libiio/include`, `libiio/src`) to `/home/root/plutosa`
+with tar and run that target there over ssh (`HOST`, `SSH_OPTS`).
+`.sdk/include` (git-ignored) is a copy of the machine's `/system/include`
+for the editor's clangd only: `ssh HOST 'tar cf - -C /system include' | tar
+xf - -C .sdk`.
 
 ## Layout
 
@@ -11,11 +25,10 @@ deploy run HOST=...`, what RitterOS's C library and `window.h` offer).
 |---|---|
 | `src/plutosa.c` | the app |
 | `libiio/` | git submodule: eloyr77/ritteros-libiio (libiio 0.26's interface, iiod's network backend only); its sources are compiled into the program (`Makefile`'s `LIBIIO`) |
-| `compile_flags.txt` | include paths for the editor's clangd only (the build uses the SDK's) |
+| `compile_flags.txt` | include paths for the editor's clangd only (`.sdk/include`; the build is the machine's) |
 | `reports/` | findings handed to other projects (e.g. the NCM link report for RitterOS's kernel) |
 
-`git submodule update --init` after a fresh clone. RitterOS is a sibling
-checkout at `../RitterOS` (`RITTEROS=` for another place).
+`git submodule update --init` after a fresh clone.
 
 ## Working style (as RitterOS's)
 
@@ -29,7 +42,7 @@ checkout at `../RitterOS` (`RITTEROS=` for another place).
 ## Roadmap (the user's choice: steps 1-5 first)
 
 1. Skeleton: window + connection thread, the receiver's settings shown (done; works on the laptop with the real Pluto, 2026-10-27).
-2. Samples: an acquisition thread reading I/Q from `cf-ad9361-lpc` (voltage0/1, `le:S12/16`).
+2. Samples: an acquisition thread reading I/Q from `cf-ad9361-lpc` (voltage0/1, `le:S12/16`) in contiguous blocks of 16384, measured (blocks/s, MS/s received, power and peak dBFS, DC offset), reconnecting after a failure (done 2026-10-27: 30-120 blocks/s, 0.3-2.4 MS/s of the Pluto's 30.72 MSPS; 150 s without a loss).
 3. DSP: our own FFT, windows (Hann, Blackman-Harris, flat-top), dBFS, averaging, max hold.
 4. Display: spectrum trace, waterfall, axes, peak marker (`window_blit` of native pixels).
 5. Controls: center frequency, span, RF bandwidth, gain/AGC, reference level.
@@ -48,12 +61,11 @@ Wi-Fi: `make deploy run HOST=root@192.168.0.195 SSH_OPTS="-i ~/.ssh/ritteros"`
 Run windowed apps in the background: the ssh session stays open until the
 window closes.
 
-**The NCM link is not reliable yet** (2026-10-27,
-`reports/2026-10-27-ncm-link-dies.md`): under many small request/response
-exchanges it stalled once for ~25 s, then stopped in both directions for
-good, with nothing logged, until the Pluto is replugged. That is RitterOS's
-kernel (usbnet), handed to its agent. Until it is fixed: a stalled link
-must not garble values (libiio now drops and reopens a connection after a
-failed exchange) and the app must survive a dead one (show it, retry).
+**The NCM link** (`reports/2026-10-27-ncm-link-dies.md`): it once stalled,
+then died for good under many small exchanges; the user says the kernel is
+fixed since (step 2 streamed 150 s without a loss). Whatever the link
+does, a stall must not garble values (libiio drops and reopens a
+connection after a failed exchange) and the app survives a dead link (it
+shows it and connects again every 2 s).
 Check before blaming the app: RitterOS `net` (eth1's received/sent), and
 the Pluto's `ifconfig usb0` over `/dev/usbserial0` (login root/analog).
