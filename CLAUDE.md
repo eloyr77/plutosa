@@ -12,9 +12,10 @@ anything of the kernel and drivers. The SDK is read from GitHub
 application/vnd.github.raw"`, likewise `sdk/API.md`, `sdk/ritteros.mk`),
 and the app is built on the machine with its own `cc` and
 `/system/sdk/ritteros.mk` (the SDK's "Building on the machine"). From the
-Mac, `make`, `make deploy`, `make run`, `make stop` copy only the app's code
-(`Makefile`, `src/`, `libiio/include`, `libiio/src`) to `/home/root/plutosa`
-with tar and run that target there over ssh (`HOST`, `SSH_OPTS`).
+Mac, `make`, `make deploy`, `make run`, `make stop`, `make check-machine`,
+`make check-radio` copy only the app's code (`Makefile`, `src/`, `tests/`,
+`libiio/include`, `libiio/src`) to `/home/root/plutosa` with tar and run
+that target there over ssh (`HOST`, `SSH_OPTS`).
 `.sdk/include` (git-ignored) is a copy of the machine's `/system/include`
 for the editor's clangd only: `ssh HOST 'tar cf - -C /system include' | tar
 xf - -C .sdk`.
