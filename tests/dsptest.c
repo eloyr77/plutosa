@@ -217,12 +217,37 @@ static void test_average_hold_peaks(void)
           "sizes other than powers of two from 8 refused", 0, 0);
 }
 
+static void test_columns_ticks(void)
+{
+    /* 8 bins into 4 columns: the higher of each pair; into 16: each bin twice. */
+    float p[8] = { 1, 5, 2, 2, 9, 0, 3, 4 }, out[16];
+    spectrum_columns(p, 8, out, 4);
+    check(out[0] == 5 && out[1] == 2 && out[2] == 9 && out[3] == 4,
+          "8 bins in 4 columns keep each column's highest (column 2)", out[2], 9);
+    spectrum_columns(p, 8, out, 16);
+    check(out[0] == 1 && out[1] == 1 && out[2] == 5 && out[15] == 4,
+          "8 bins in 16 columns: each bin twice (column 2)", out[2], 5);
+    /* A one-bin peak among 16384 bins still shows in 900 columns. */
+    static float wide[16384];
+    static float cols[900];
+    wide[12345] = 1;
+    spectrum_columns(wide, 16384, cols, 900);
+    int x = 12345 * 900 / 16384;
+    check(cols[x] == 1, "a one-bin peak of 16384 bins shows in 900 columns (column)", x, x);
+
+    near("tick step for 0.37", tick_step(0.37), 0.5, 1e-12);
+    near("tick step for 3.07e6 (Hz)", tick_step(3.07e6), 5e6, 1e-3);
+    near("tick step for 10", tick_step(10), 10, 1e-12);
+    near("tick step for 1.2e-3", tick_step(1.2e-3), 2e-3, 1e-15);
+}
+
 int main(void)
 {
     test_fft();
     test_windows();
     test_noise();
     test_average_hold_peaks();
+    test_columns_ticks();
     if (failures) {
         printf("%d check(s) failed.\n", failures);
         return 1;

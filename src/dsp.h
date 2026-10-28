@@ -52,6 +52,15 @@ int spectrum_peaks(const float *power, int n, int guard, int *bins, int max);
  * mostly noise. */
 double spectrum_floor(const float *power, int n);
 
+/* power (n bins) shown in `columns` pixel columns: each column the highest
+ * of the bins it covers, so a narrow peak never falls between columns
+ * (columns > n: a bin over several columns). */
+void spectrum_columns(const float *power, int n, float *out, int columns);
+
+/* A round step for an axis (1, 2 or 5 times a power of ten) at least
+ * `wanted`: ticks every so many Hz or dB. */
+double tick_step(double wanted);
+
 /* 10 log10(power), -999 for nothing at all. */
 double power_db(double power);
 

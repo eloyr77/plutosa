@@ -206,6 +206,32 @@ double spectrum_floor(const float *power, int n)
     return median;
 }
 
+void spectrum_columns(const float *power, int n, float *out, int columns)
+{
+    for (int x = 0; x < columns; x++) {
+        int lo = (int)((long)x * n / columns), hi = (int)((long)(x + 1) * n / columns);
+        if (hi <= lo)
+            hi = lo + 1;
+        float m = power[lo];
+        for (int j = lo + 1; j < hi; j++)
+            if (power[j] > m)
+                m = power[j];
+        out[x] = m;
+    }
+}
+
+double tick_step(double wanted)
+{
+    if (!(wanted > 0))
+        return 1;
+    double decade = pow(10, floor(log10(wanted)));
+    static const double STEPS[] = { 1, 2, 5, 10 };
+    for (int k = 0; k < 4; k++)
+        if (STEPS[k] * decade >= wanted * (1 - 1e-9))
+            return STEPS[k] * decade;
+    return 10 * decade;
+}
+
 double power_db(double power)
 {
     return power > 0 ? 10 * log10(power) : -999;

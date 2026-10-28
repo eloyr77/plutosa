@@ -10,6 +10,8 @@
 #   make stop HOST=...               end it there
 #   make check                       the spectrum's arithmetic (src/dsp.c) tested here
 #   make check-machine HOST=...      the same test built and run on the machine
+#   make check-radio HOST=...        src/radio.c on the real Pluto (receive settings
+#                                    changed, read back, then put back)
 #
 # HOST and SSH_OPTS (e.g. SSH_OPTS="-i ~/.ssh/ritteros") can also be set in
 # the environment. libiio comes from the submodule libiio/
@@ -18,7 +20,7 @@
 APP      := plutosa
 KIND     := apps
 LIBIIO   := libiio/src/iio.c libiio/src/iioxml.c libiio/src/iionet.c
-SRCS     := src/plutosa.c src/dsp.c $(LIBIIO)
+SRCS     := src/plutosa.c src/dsp.c src/radio.c src/view.c $(LIBIIO)
 CFLAGS   += -Werror -Ilibiio/include
 
 ifeq ($(wildcard libiio/include/iio.h),)
@@ -34,9 +36,17 @@ build/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
 	@mkdir -p build
 	cc -Werror -Isrc -o $@ tests/dsptest.c src/dsp.c
 
-.PHONY: check
+# radio.c on the real Pluto (ARGS: another URI).
+build/radiotest: tests/radiotest.c src/radio.c src/radio.h $(LIBIIO)
+	@mkdir -p build
+	cc -Werror -Isrc -Ilibiio/include -o $@ tests/radiotest.c src/radio.c $(LIBIIO)
+
+.PHONY: check check-radio
 check: build/dsptest
 	build/dsptest
+
+check-radio: build/radiotest
+	build/radiotest $(ARGS)
 else
 # On another computer: only the app's code goes over, and make runs there.
 REMOTE_DIR ?= /home/root/plutosa
@@ -79,10 +89,13 @@ build/host/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -Isrc -o $@ tests/dsptest.c src/dsp.c -lm
 
-.PHONY: check check-machine
+.PHONY: check check-machine check-radio
 check: build/host/dsptest
 	build/host/dsptest
 
 check-machine: push
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make check'
+
+check-radio: push
+	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make check-radio ARGS="$(ARGS)"'
 endif
