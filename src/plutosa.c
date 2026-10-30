@@ -33,6 +33,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "demod.h"
 #include "dsp.h"
 #include "iio.h"
 #include "radio.h"
@@ -40,8 +41,9 @@
 #include "view.h"
 #include "window.h"
 
-PROGRAM_HELP("plutosa [URI] [-p FILE]",
-             "spectrum analyzer for the ADALM-Pluto (URI: ip:192.168.2.1; -p: the picture to FILE)");
+PROGRAM_HELP("plutosa [URI] [-p FILE] [-f MHZ]",
+             "spectrum analyzer for the ADALM-Pluto (URI: ip:192.168.2.1; -p: the picture to FILE "
+             "(and FILE-fm); -f: the FM window open at MHZ)");
 
 #define DEFAULT_URI "ip:192.168.2.1"
 #define BLOCK       65536           /* samples per block (FFT frames of up to 16384) */
@@ -58,6 +60,18 @@ PROGRAM_HELP("plutosa [URI] [-p FILE]",
                                      * buffers (4) may hold samples from before it */
 #define GAIN_STEP   3               /* dB, + and - */
 #define LEVEL_STEP  10              /* dB, the reference level's */
+/* The FM window. */
+#define FM_W        760
+#define FM_H        520
+#define FM_FFT      2048            /* points of the channel's spectrum (24 Hz at 50 kHz) */
+#define FM_AVERAGES 4
+#define FM_HALF     10000.0         /* Hz either side of the channel shown */
+#define FM_STEP     500.0           /* Hz: the arrows and the wheel tune by this */
+#define FM_MAX_BANDWIDTH 20000.0
+#define FM_MIN_BANDWIDTH 1000.0
+#define FM_MAX_VOLUME 4.0           /* 400% */
+#define VOLUME_STEP 0.1
+#define CHANNEL_MAX 8192            /* channel samples a block makes, at most */
 
 /* What the keys choose from. */
 static const int FFT_SIZES[] = { 1024, 4096, 16384 };
@@ -65,22 +79,34 @@ static const int AVERAGES[] = { 1, 4, 16, 64 };
 static const double SPANS[] = { 2.5e6, 5e6, 10e6, 20e6, 30.72e6, 40e6, 56e6 };
 static const double BANDWIDTHS[] = { 0, 1e6, 2e6, 5e6, 10e6, 20e6, 40e6, 56e6 };   /* 0: = span */
 static const char *const GAIN_MODES[] = { "slow_attack", "fast_attack", "hybrid", "manual" };
+static const double FM_BANDWIDTHS[] = { 3000, 5000, 6250, 8330, 10000, 12500, 16000, 20000 };
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 static const char *const KEYS[2] = {
     "click a value or type MHz: set it  arrows/wheel: tune, level  double-click: center  "
     "s/S span",
-    "b/B bandwidth  g gain mode  +/- gain  f FFT size  w window  a averaging  m max hold  r reset",
+    "b/B bandwidth  g gain mode  +/- gain  f FFT size  w window  a averaging  m max hold  r reset"
+    "  d FM",
+};
+static const char *const FM_KEYS[2] = {     /* (80 characters at most: the window's width) */
+    "click a value or type MHz  arrows/wheel: tune 0.5 kHz, level  double-click: tune",
+    "+/- volume  b/B bandwidth  m max hold  r reset  (main window: a click tunes)",
 };
 
-/* The values a click on the text edits (view_data's values), typed in
- * their unit. */
-enum { VALUE_LO, VALUE_SPAN, VALUE_BANDWIDTH, VALUE_GAIN };
-static const struct { const char *name, *unit; double scale; } VALUES[VIEW_VALUES] = {
+/* The values a click on the text edits, typed in their unit: the main
+ * window's (its view_data's values 0-3) and the FM window's (its 0-2). */
+enum {
+    VALUE_LO, VALUE_SPAN, VALUE_BANDWIDTH, VALUE_GAIN,
+    VALUE_FM_FREQUENCY, VALUE_FM_BANDWIDTH, VALUE_FM_VOLUME, VALUES_COUNT
+};
+static const struct { const char *name, *unit; double scale; } VALUES[VALUES_COUNT] = {
     [VALUE_LO] = { "LO", "MHz", 1e6 },
     [VALUE_SPAN] = { "span", "MHz", 1e6 },
     [VALUE_BANDWIDTH] = { "RF bandwidth", "MHz", 1e6 },
     [VALUE_GAIN] = { "gain", "dB", 1 },
+    [VALUE_FM_FREQUENCY] = { "FM frequency", "MHz", 1e6 },
+    [VALUE_FM_BANDWIDTH] = { "FM bandwidth", "kHz", 1e3 },
+    [VALUE_FM_VOLUME] = { "volume", "%", 0.01 },
 };
 #define EDIT_W      120             /* the edit box's width at least, pixels */
 
@@ -98,7 +124,7 @@ static char settings_line[200], measure_line[200];
 static float shown_average[VIEW_MAX_COLUMNS], shown_hold[VIEW_MAX_COLUMNS];
 static struct view_data shown = {
     .average = shown_average, .hold = shown_hold, .marker = -1,
-    .ref_db = 0, .range_db = 100, .keys = { 0, 0 },
+    .ref_db = 0, .range_db = 100, .keys = { 0, 0 }, .button = "FM demodulator", .button_line = 0,
 };
 static bool fresh;                  /* a new spectrum since the last picture */
 static bool redraw;                 /* something else changed */
@@ -120,13 +146,34 @@ static unsigned asked;
  * the drawing thread holds while it draws. */
 static bool pending;
 static int bandwidth_choice;        /* BANDWIDTHS: = span until chosen */
-/* A value being typed: the SDK's text field over it (the main thread
- * gives it the events, the drawing thread draws it over each picture). */
-static struct window_field *field;
-static int editing = -1;            /* VALUES, -1: none */
-static int box_x, box_y, box_w, box_h;
-static char hint[200];              /* shown instead of the status meanwhile */
-static bool hint_bad;               /* the last value typed was refused */
+/* A value being typed in a window: the SDK's text field over it (the
+ * window's events thread gives it the events, the drawing thread draws it
+ * over each picture). */
+struct editor {
+    struct window_field *field;
+    int editing;                    /* VALUES, -1: none */
+    int box_x, box_y, box_w, box_h;
+    char hint[200];                 /* shown instead of the status meanwhile */
+    bool hint_bad;                  /* the last value typed was refused */
+    int sequence;                   /* in_sequence's state for this window's keys */
+};
+static struct editor main_edit = { .editing = -1 };
+
+/* The FM window (open while fm_win is not 0) and what it asks of the
+ * demodulator: the channel's frequency (kept inside the span by the
+ * demodulating thread), bandwidth and volume. */
+static struct window *fm_win;
+static struct view *fm_view;
+static struct editor fm_edit = { .editing = -1 };
+static double fm_hz, fm_bandwidth = 12500, fm_volume = 0.3;   /* (FM's hiss without a signal is loud) */
+static char fm_status[200], fm_values_line[200], fm_measure_line[200];
+static bool fm_failed, fm_fresh, fm_redraw;
+static float fm_average[VIEW_MAX_COLUMNS], fm_hold[VIEW_MAX_COLUMNS];
+static struct view_data fm_shown = {
+    .average = fm_average, .hold = fm_hold, .marker = -1, .ref_db = 0, .range_db = 100,
+    .offsets = true, .button = "reset", .button_line = 1,
+};
+static bool fm_reset;               /* the FM window's measurements to start again */
 
 /* Sets the status line and prints it. */
 __attribute__((format(printf, 2, 3)))
@@ -165,10 +212,12 @@ struct tally {
     int peak;                           /* the largest |I| or |Q| */
 };
 
-/* Adds to text line `line` (1 or 2, shown.lines' index); with value >= 0,
- * what it adds is that value, for a click to edit (under the lock). */
-__attribute__((format(printf, 5, 6)))
-static void append(char *text, size_t size, int line, int value, const char *fmt, ...)
+/* Adds to text line `line` (1 or 2, d->lines' index); with value >= 0 (an
+ * index in d->values), what it adds is that value, for a click to edit
+ * (under the lock). */
+__attribute__((format(printf, 6, 7)))
+static void append(struct view_data *d, char *text, size_t size, int line, int value,
+                   const char *fmt, ...)
 {
     size_t start = strlen(text);
     if (start + 1 >= size)
@@ -178,7 +227,7 @@ static void append(char *text, size_t size, int line, int value, const char *fmt
     vsnprintf(text + start, size - start, fmt, ap);
     va_end(ap);
     if (value >= 0)
-        shown.values[value] = (struct view_value){ line, (int)start, (int)strlen(text) };
+        d->values[value] = (struct view_value){ line, (int)start, (int)strlen(text) };
 }
 
 /* The text's two lines from an interval's measurements; printed now and
@@ -194,23 +243,23 @@ static void show_tally(const struct tally *t, const struct spectrum *sp, const s
     pthread_mutex_lock(&lock);
     /* (each about 100 characters at most: the 960-pixel window's width) */
     settings_line[0] = measure_line[0] = 0;
-    append(settings_line, sizeof(settings_line), 1, -1, "LO ");
-    append(settings_line, sizeof(settings_line), 1, VALUE_LO, "%.6f MHz", r->lo / 1e6);
-    append(settings_line, sizeof(settings_line), 1, -1, "  span ");
-    append(settings_line, sizeof(settings_line), 1, VALUE_SPAN, "%.3f MHz", r->rate / 1e6);
-    append(settings_line, sizeof(settings_line), 1, -1, "  BW ");
-    append(settings_line, sizeof(settings_line), 1, VALUE_BANDWIDTH, "%.3f MHz",
+    append(&shown, settings_line, sizeof(settings_line), 1, -1, "LO ");
+    append(&shown, settings_line, sizeof(settings_line), 1, VALUE_LO, "%.6f MHz", r->lo / 1e6);
+    append(&shown, settings_line, sizeof(settings_line), 1, -1, "  span ");
+    append(&shown, settings_line, sizeof(settings_line), 1, VALUE_SPAN, "%.3f MHz", r->rate / 1e6);
+    append(&shown, settings_line, sizeof(settings_line), 1, -1, "  BW ");
+    append(&shown, settings_line, sizeof(settings_line), 1, VALUE_BANDWIDTH, "%.3f MHz",
            r->bandwidth / 1e6);
-    append(settings_line, sizeof(settings_line), 1, -1, "  RBW %.2f kHz  FFT %d %s  avg %d",
+    append(&shown, settings_line, sizeof(settings_line), 1, -1, "  RBW %.2f kHz  FFT %d %s  avg %d",
            r->rate * sp->enbw / n / 1e3, n, taper_name(sp->taper), sp->averages);
-    append(measure_line, sizeof(measure_line), 2, -1, "gain ");
-    append(measure_line, sizeof(measure_line), 2, VALUE_GAIN, "%.0f dB", r->gain);
-    append(measure_line, sizeof(measure_line), 2, -1,
-           " %s  power %.1f dBFS  peak %.1f  floor %.1f dBFS/bin  %.0f FFT/s",
+    append(&shown, measure_line, sizeof(measure_line), 2, -1, "gain ");
+    append(&shown, measure_line, sizeof(measure_line), 2, VALUE_GAIN, "%.0f dB", r->gain);
+    append(&shown, measure_line, sizeof(measure_line), 2, -1,
+           " %s  dBFS: power %.1f peak %.1f floor %.1f/bin  %.0f FFT/s",
            r->mode, power_db(t->sum_power / samples), 20 * log10(t->peak / FULL_SCALE), floor_db,
            (double)t->frames / secs);
     if (lost >= 0)                          /* (measured over LOSS_S: not at once) */
-        append(measure_line, sizeof(measure_line), 2, -1, "  %.2f MS/s (%.0f%% lost)",
+        append(&shown, measure_line, sizeof(measure_line), 2, -1, "  %.2f MS/s %.0f%% lost",
                received / 1e6, 100 * lost);
     redraw = true;
     if (print) {
@@ -584,6 +633,182 @@ static void *spectrum_thread(void *arg)
     return 0;
 }
 
+/* --- The FM demodulator's thread: every block in order --- */
+
+static void fm_values(void);
+static double fm_inside(double hz, double lo, double rate);
+
+/* The channel's spectrum to the FM window: its middle +-FM_HALF reduced
+ * to the plot's columns, with its strongest peak for the marker. */
+static void fm_publish(const struct spectrum *sp, double channel_rate, double hz)
+{
+    static float average[VIEW_MAX_COLUMNS], hold[VIEW_MAX_COLUMNS];
+    int n = sp->n;
+    double bin = channel_rate / n;
+    int half = (int)lround(FM_HALF / bin);
+    if (half > n / 2)
+        half = n / 2;
+    int start = n / 2 - half, count = 2 * half, peak;
+    pthread_mutex_lock(&lock);
+    int columns = fm_view ? view_columns(fm_view) : 0;
+    pthread_mutex_unlock(&lock);
+    if (columns <= 0)
+        return;
+    spectrum_columns(sp->average + start, count, average, columns);
+    spectrum_columns(sp->hold + start, count, hold, columns);
+    bool marked = spectrum_peaks(sp->average + start, count, (int)ceil(2 * sp->enbw), &peak, 1) == 1;
+    pthread_mutex_lock(&lock);
+    if (fm_view && columns == view_columns(fm_view)) {
+        memcpy(fm_average, average, (size_t)columns * sizeof(float));
+        memcpy(fm_hold, hold, (size_t)columns * sizeof(float));
+        fm_shown.columns = columns;
+        fm_shown.lo = hz;
+        fm_shown.rate = count * bin;
+        fm_shown.marker = marked ? (int)((long)peak * columns / count) : -1;
+        if (marked) {
+            fm_shown.marker_hz = hz + (peak - half) * bin;
+            fm_shown.marker_db = power_db(sp->average[start + peak]);
+        }
+        fm_fresh = true;
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+/* While the FM window is open: every block through the demodulator, in
+ * order (one missed, overwritten in the ring before it came to it, or a
+ * change of the receiver, starts its discriminator again); the channel's
+ * samples become the window's spectrum, the audio (D4: still unplayed)
+ * is measured. The channel stays inside the span. */
+static void *fm_thread(void *arg)
+{
+    (void)arg;
+    static struct block b;
+    static float ci[CHANNEL_MAX], cq[CHANNEL_MAX], frame_i[FM_FFT], frame_q[FM_FFT];
+    static int16_t sound[2 * CHANNEL_MAX];
+    struct spectrum *sp = spectrum_new(FM_FFT, TAPER_BLACKMAN_HARRIS, FM_AVERAGES);
+    struct demod *d = 0;
+    double d_rate = 0;
+    unsigned long last = 0, missed = 0;
+    unsigned stream = 0;
+    bool was_open = false;
+    int filled = 0, loudest = 0;
+    double power = 0, start = now_s(), published = 0;
+    long channel = 0, frames = 0;
+    if (!sp)
+        return 0;
+    for (;;) {
+        pthread_mutex_lock(&blocks_lock);
+        while (written == last)
+            pthread_cond_wait(&blocks_came, &blocks_lock);
+        unsigned long next = last == 0 ? written : last + 1;
+        unsigned long oldest = written >= SLOTS ? written - SLOTS + 1 : 1;
+        bool gap = false;
+        if (next < oldest) {
+            missed += oldest - next;
+            next = oldest;
+            gap = true;
+        }
+        b = ring[next % SLOTS];
+        last = next;
+        double lost = link_lost;
+        pthread_mutex_unlock(&blocks_lock);
+
+        pthread_mutex_lock(&lock);
+        bool open = fm_win != 0;
+        double hz = fm_hz, bandwidth = fm_bandwidth, volume = fm_volume;
+        if (open) {
+            double inside = fm_inside(hz, b.lo, b.rate);
+            if (inside != hz) {
+                fm_hz = hz = inside;
+                fm_values();
+            }
+        }
+        pthread_mutex_unlock(&lock);
+        if (!open) {
+            was_open = false;
+            continue;
+        }
+        if (!was_open) {                        /* (opened: everything anew) */
+            was_open = true;
+            gap = true;
+            missed = 0;
+            spectrum_reset(sp);
+            filled = 0;
+        }
+        pthread_mutex_lock(&lock);
+        bool reset = fm_reset;
+        fm_reset = false;
+        pthread_mutex_unlock(&lock);
+        if (reset) {                            /* (the window's reset: the measurements anew) */
+            missed = 0;
+            spectrum_reset(sp);
+            power = 0, channel = frames = 0, loudest = 0;
+            start = now_s();
+        }
+        if (!d || d_rate != b.rate) {
+            demod_free(d);
+            d = demod_new(b.rate, hz - b.lo, bandwidth);
+            d_rate = b.rate;
+            spectrum_reset(sp);
+            filled = 0;
+            if (!d)
+                continue;
+        } else if (gap || b.stream != stream) {
+            demod_gap(d);
+        }
+        stream = b.stream;
+        demod_tune(d, hz - b.lo, bandwidth);
+        demod_volume(d, volume);
+        struct demod_out out = { .ci = ci, .cq = cq, .channel_max = CHANNEL_MAX,
+                                 .audio = sound, .frames_max = CHANNEL_MAX };
+        demod_run(d, b.iq, b.count, &out);
+        power += out.power * out.channel;
+        channel += out.channel;
+        frames += out.frames;
+        for (int j = 0; j < out.frames; j++) {
+            int a = sound[2 * j] < 0 ? -sound[2 * j] : sound[2 * j];
+            if (a > loudest)
+                loudest = a;
+        }
+        for (int j = 0; j < out.channel; j++) {
+            frame_i[filled] = ci[j];
+            frame_q[filled] = cq[j];
+            if (++filled == FM_FFT) {
+                spectrum_add(sp, frame_i, frame_q);
+                filled = 0;
+            }
+        }
+        double at = now_s();
+        if (at - published >= 1.0 / PICTURES && sp->frames > 0) {
+            fm_publish(sp, demod_channel_rate(d), hz);
+            published = at;
+        }
+        if (at - start >= SHOW_S && channel > 0) {
+            pthread_mutex_lock(&lock);
+            snprintf(fm_status, sizeof(fm_status),
+                     "narrow FM %+.3f kHz from the LO  channel %.0f/s (/%d)  audio %.0f/s",
+                     (hz - b.lo) / 1e3, demod_channel_rate(d), demod_decimation(d),
+                     (double)frames / (at - start));
+            fm_failed = lost > 0.01 || missed > 0;
+            int n = snprintf(fm_measure_line, sizeof(fm_measure_line),
+                             "level %.1f dBFS in the channel  audio peak %.1f dBFS",
+                             power_db(power / (double)channel),
+                             loudest > 0 ? 20 * log10(loudest / 32767.0) : -999.0);
+            if (lost >= 0 && n > 0 && n < (int)sizeof(fm_measure_line))
+                n += snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
+                              "  %.0f%% lost", 100 * lost);
+            if (missed > 0 && n > 0 && n < (int)sizeof(fm_measure_line))
+                snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
+                         "  %lu blocks missed", missed);
+            fm_redraw = true;
+            pthread_mutex_unlock(&lock);
+            power = 0, channel = frames = 0, loudest = 0;
+            start = at;
+        }
+    }
+    return 0;
+}
+
 /* Draws when there is something new, at most PICTURES a second; each new
  * spectrum is a waterfall row. */
 static void *draw_thread(void *arg)
@@ -594,19 +819,42 @@ static void *draw_thread(void *arg)
         usleep(1000000 / PICTURES);
         pthread_mutex_lock(&lock);
         if (fresh || redraw) {
-            shown.lines[0] = editing >= 0 ? hint : status;
+            shown.lines[0] = main_edit.editing >= 0 ? main_edit.hint : status;
             shown.lines[1] = settings_line;
             shown.lines[2] = measure_line;
-            shown.failed = editing >= 0 ? hint_bad : failed;
+            shown.failed = main_edit.editing >= 0 ? main_edit.hint_bad : failed;
+            shown.band_lo = fm_win ? fm_hz - fm_bandwidth / 2 : 0;
+            shown.band_hi = fm_win ? fm_hz + fm_bandwidth / 2 : 0;
             view_draw(view, &shown, fresh);
-            if (editing >= 0)
-                window_field_draw(field);
+            if (main_edit.editing >= 0)
+                window_field_draw(main_edit.field);
             window_flush(win);
             fresh = redraw = false;
+        }
+        if (fm_win && (fm_fresh || fm_redraw)) {
+            fm_shown.lines[0] = fm_edit.editing >= 0 ? fm_edit.hint : fm_status;
+            fm_shown.lines[1] = fm_values_line;
+            fm_shown.lines[2] = fm_measure_line;
+            fm_shown.failed = fm_edit.editing >= 0 ? fm_edit.hint_bad : fm_failed;
+            fm_shown.band_lo = fm_hz - fm_bandwidth / 2;
+            fm_shown.band_hi = fm_hz + fm_bandwidth / 2;
+            view_draw(fm_view, &fm_shown, fm_fresh);
+            if (fm_edit.editing >= 0)
+                window_field_draw(fm_edit.field);
+            window_flush(fm_win);
+            fm_fresh = fm_redraw = false;
         }
         if (picture_file && now_s() - saved >= PRINT_S) {
             if (view_save(view, picture_file) < 0)
                 printf("plutosa: cannot write %s: %s\n", picture_file, strerror(errno));
+            /* The FM window's beside it: FILE-fm (before a .ppm). */
+            char fm_file[512];
+            size_t len = strlen(picture_file);
+            bool ppm = len > 4 && !strcmp(picture_file + len - 4, ".ppm");
+            snprintf(fm_file, sizeof(fm_file), "%.*s-fm%s", (int)(ppm ? len - 4 : len),
+                     picture_file, ppm ? ".ppm" : "");
+            if (fm_win && view_save(fm_view, fm_file) < 0)
+                printf("plutosa: cannot write %s: %s\n", fm_file, strerror(errno));
             saved = now_s();
         }
         pthread_mutex_unlock(&lock);
@@ -705,24 +953,42 @@ static void ask_gain(int dir)
     ask_gain_db((asked & ASK_GAIN ? want.gain : now.gain) + dir * GAIN_STEP);
 }
 
-static void set_level(double db)
+static void set_level(struct view_data *d, double db)
 {
     if (db > 30)
         db = 30;
     if (db < -150)
         db = -150;
-    shown.ref_db = db;
+    d->ref_db = db;
 }
 
-/* --- A value typed in the edit box --- */
+/* --- A value typed in an edit box --- */
 
-static const struct range *value_range(int k)
+/* The range value k may be typed in (in Hz, dB or a fraction). */
+static struct range value_range(int k)
 {
-    return k == VALUE_LO ? &now.lo_range : k == VALUE_SPAN ? &now.rate_range
-         : k == VALUE_BANDWIDTH ? &now.bandwidth_range : &now.gain_range;
+    switch (k) {
+    case VALUE_LO:
+        return now.lo_range;
+    case VALUE_SPAN:
+        return now.rate_range;
+    case VALUE_BANDWIDTH:
+        return now.bandwidth_range;
+    case VALUE_GAIN:
+        return now.gain_range;
+    case VALUE_FM_FREQUENCY: {
+        /* Inside the span, the channel's band too. */
+        double half = base_rate() / 2 - fm_bandwidth / 2;
+        return (struct range){ base_rate() > 0, base_lo() - half, 0, base_lo() + half };
+    }
+    case VALUE_FM_BANDWIDTH:
+        return (struct range){ true, FM_MIN_BANDWIDTH, 0, FM_MAX_BANDWIDTH };
+    default:
+        return (struct range){ true, 0, 0, FM_MAX_VOLUME };
+    }
 }
 
-/* What value k is, or is asked to be (in Hz or dB). */
+/* What value k is, or is asked to be. */
 static double value_now(int k)
 {
     switch (k) {
@@ -732,31 +998,45 @@ static double value_now(int k)
         return base_rate();
     case VALUE_BANDWIDTH:
         return asked & ASK_BANDWIDTH ? want.bandwidth : now.bandwidth;
-    default:
+    case VALUE_GAIN:
         return asked & ASK_GAIN ? want.gain : now.gain;
+    case VALUE_FM_FREQUENCY:
+        return fm_hz;
+    case VALUE_FM_BANDWIDTH:
+        return fm_bandwidth;
+    default:
+        return fm_volume;
     }
+}
+
+static void redraw_window_of(const struct editor *e)
+{
+    if (e == &fm_edit)
+        fm_redraw = true;
+    else
+        redraw = true;
 }
 
 /* The line shown instead of the status while value k is typed: its unit
  * and range; `bad` after a refusal (in red). */
-static void describe(int k, bool bad)
+static void describe(struct editor *e, int k, bool bad)
 {
-    const struct range *r = value_range(k);
+    struct range r = value_range(k);
     double scale = VALUES[k].scale;
-    int n = snprintf(hint, sizeof(hint), "%s%s in %s", bad ? "not a number in range: " : "",
+    int n = snprintf(e->hint, sizeof(e->hint), "%s%s in %s", bad ? "not a number in range: " : "",
                      VALUES[k].name, VALUES[k].unit);
-    if (r->known && n > 0 && n < (int)sizeof(hint))
-        n += snprintf(hint + n, sizeof(hint) - (size_t)n, ", %.7g to %.7g", r->min / scale,
-                      r->max / scale);
-    if (n > 0 && n < (int)sizeof(hint))
-        snprintf(hint + n, sizeof(hint) - (size_t)n, "   (Enter sets it, Esc gives up)");
-    hint_bad = bad;
-    redraw = true;
+    if (r.known && n > 0 && n < (int)sizeof(e->hint))
+        n += snprintf(e->hint + n, sizeof(e->hint) - (size_t)n, ", %.7g to %.7g", r.min / scale,
+                      r.max / scale);
+    if (n > 0 && n < (int)sizeof(e->hint))
+        snprintf(e->hint + n, sizeof(e->hint) - (size_t)n, "   (Enter sets it, Esc gives up)");
+    e->hint_bad = bad;
+    redraw_window_of(e);
 }
 
 /* Opens the edit box over value k, with its present value selected (typing
  * replaces it), or empty. */
-static void edit_value(int k, bool empty)
+static void edit_value(struct editor *e, int k, bool empty)
 {
     char text[32] = "";
     if (!empty) {
@@ -767,34 +1047,59 @@ static void edit_value(int k, bool empty)
         if (end > text && end[-1] == '.')
             end[-1] = 0;
     }
-    box_h = window_field_height(field);
-    view_value_box(view, &shown, k, box_h, EDIT_W, &box_x, &box_y, &box_w);
-    window_field_place(field, box_x, box_y, box_w);
-    window_field_set_text(field, text);
-    window_field_focus(field, 1);
-    editing = k;
-    describe(k, false);
+    e->box_h = window_field_height(e->field);
+    if (e == &fm_edit)
+        view_value_box(fm_view, &fm_shown, k - VALUE_FM_FREQUENCY, e->box_h, EDIT_W, &e->box_x,
+                       &e->box_y, &e->box_w);
+    else
+        view_value_box(view, &shown, k, e->box_h, EDIT_W, &e->box_x, &e->box_y, &e->box_w);
+    window_field_place(e->field, e->box_x, e->box_y, e->box_w);
+    window_field_set_text(e->field, text);
+    window_field_focus(e->field, 1);
+    e->editing = k;
+    describe(e, k, false);
 }
 
-static void stop_editing(void)
+static void stop_editing(struct editor *e)
 {
-    window_field_focus(field, 0);
-    editing = -1;
-    redraw = true;
+    window_field_focus(e->field, 0);
+    e->editing = -1;
+    redraw_window_of(e);
 }
 
-/* The edit box's text as value k: asked of the receiver, or false (not a
- * number, or outside the Pluto's range: nothing asked). */
+/* The FM channel's bandwidth: the next (dir 1) or previous (-1) from the
+ * list, from the present. */
+static void fm_step_bandwidth(int dir)
+{
+    int k;
+    if (dir > 0) {
+        for (k = 0; k < COUNT(FM_BANDWIDTHS) - 1 && FM_BANDWIDTHS[k] <= fm_bandwidth + 1; k++)
+            ;
+    } else {
+        for (k = COUNT(FM_BANDWIDTHS) - 1; k > 0 && FM_BANDWIDTHS[k] >= fm_bandwidth - 1; k--)
+            ;
+    }
+    fm_bandwidth = FM_BANDWIDTHS[k];
+}
+
+static void fm_set_volume(double volume)
+{
+    fm_volume = volume < 0 ? 0 : volume > FM_MAX_VOLUME ? FM_MAX_VOLUME : volume;
+}
+
+/* The edit box's text as value k: asked of the receiver (or set for the
+ * demodulator), or false (not a number, or outside the range: nothing
+ * done). */
 static bool ask_value(int k, const char *text)
 {
     char *end;
     double typed = strtod(text, &end), v = typed * VALUES[k].scale;
     while (*end == ' ')
         end++;
-    const struct range *r = value_range(k);
+    struct range r = value_range(k);
     double slack = VALUES[k].scale * 1e-6;      /* (the range as shown: 7 digits) */
     if (end == text || *end || !isfinite(typed) ||
-        (r->known && (v < r->min - slack || v > r->max + slack)))
+        (r.known && (v < r.min - slack || v > r.max + slack)))
         return false;
     switch (k) {
     case VALUE_LO:
@@ -806,37 +1111,46 @@ static bool ask_value(int k, const char *text)
     case VALUE_BANDWIDTH:
         ask_bandwidth_hz(v);
         break;
-    default:
+    case VALUE_GAIN:
         ask_gain_db(v);
+        break;
+    case VALUE_FM_FREQUENCY:
+        fm_hz = v;
+        break;
+    case VALUE_FM_BANDWIDTH:
+        fm_bandwidth = v;
+        break;
+    default:
+        fm_set_volume(v);
     }
     return true;
 }
 
-/* While the edit box is open, it has the events first: true when one was
- * its (every key is, while it is open). Escape or a click outside it closes
- * it; Enter sets the value, or says why not and leaves it open. */
-static bool field_event(const struct window_event *ev, bool pressed)
+/* While a window's edit box is open, it has the events first: true when
+ * one was its (every key is, while it is open). Escape or a click outside
+ * it closes it; Enter sets the value, or says why not and leaves it open. */
+static bool field_event(struct editor *e, const struct window_event *ev, bool pressed)
 {
-    if (editing < 0)
+    if (e->editing < 0)
         return false;
     bool key = ev->type == WINDOW_KEY || ev->type == WINDOW_KEY_DOWN || ev->type == WINDOW_KEY_UP;
     if (ev->type == WINDOW_KEY_DOWN && ev->key == WKEY_ESCAPE) {
-        stop_editing();
+        stop_editing(e);
         return true;
     }
-    if (pressed && !(ev->x >= box_x && ev->x < box_x + box_w && ev->y >= box_y &&
-                     ev->y < box_y + box_h)) {
-        stop_editing();
+    if (pressed && !(ev->x >= e->box_x && ev->x < e->box_x + e->box_w && ev->y >= e->box_y &&
+                     ev->y < e->box_y + e->box_h)) {
+        stop_editing(e);
         return false;                           /* (the click is the window's) */
     }
-    int taken = window_field_event(field, ev);
+    int taken = window_field_event(e->field, ev);
     if (taken == 1) {
         if (!connected)
-            stop_editing();
-        else if (ask_value(editing, window_field_text(field)))
-            stop_editing();
+            stop_editing(e);
+        else if (ask_value(e->editing, window_field_text(e->field)))
+            stop_editing(e);
         else
-            describe(editing, true);
+            describe(e, e->editing, true);
     }
     return taken >= 0 || key;
 }
@@ -844,24 +1158,182 @@ static bool field_event(const struct window_event *ev, bool pressed)
 /* Whether a key's byte is part of an escape sequence (the bytes of an
  * arrow or another key without a character, ESC [ ... or ESC O ..., which
  * come as WINDOW_KEY_DOWN too): the B of the down arrow's must not step
- * the bandwidth. */
-static bool in_sequence(int byte)
+ * the bandwidth. `state` is the window's (1: after ESC, 2: in one). */
+static bool in_sequence(int *state, int byte)
 {
-    static int state;                           /* 1: after ESC, 2: in the sequence */
     if (byte == 27) {
-        state = 1;
+        *state = 1;
         return true;
     }
-    if (state == 1) {
-        state = byte == '[' || byte == 'O' ? 2 : 0;
-        return state == 2;
+    if (*state == 1) {
+        *state = byte == '[' || byte == 'O' ? 2 : 0;
+        return *state == 2;
     }
-    if (state == 2) {
+    if (*state == 2) {
         if (byte >= 0x40 && byte <= 0x7E)       /* (the final byte) */
-            state = 0;
+            *state = 0;
         return true;
     }
     return false;
+}
+
+/* --- The FM window (its events thread; all under the lock) --- */
+
+/* The channel inside the span (lo +- rate / 2), its band too. */
+static double fm_inside(double hz, double lo, double rate)
+{
+    double half = rate / 2 - fm_bandwidth / 2;
+    if (rate <= 0 || half <= 0)
+        return hz;
+    return hz > lo + half ? lo + half : hz < lo - half ? lo - half : hz;
+}
+
+/* The FM window's values line (its values 0-2: frequency, bandwidth,
+ * volume) from what is asked now. */
+static void fm_values(void)
+{
+    fm_values_line[0] = 0;
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "frequency ");
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 0, "%.6f MHz", fm_hz / 1e6);
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  bandwidth ");
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 1, "%.2f kHz", fm_bandwidth / 1e3);
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  volume ");
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 2, "%.0f%%", fm_volume * 100);
+    fm_redraw = true;
+}
+
+static void *fm_events(void *arg);
+
+/* Opens the FM window at hz (0: where it was, else the main window's
+ * marker, else a quarter span above the LO). */
+static void fm_open(double hz)
+{
+    if (fm_win)
+        return;
+    if (hz > 0)
+        fm_hz = hz;
+    else if (fm_hz <= 0 || (connected && fm_inside(fm_hz, base_lo(), base_rate()) != fm_hz))
+        fm_hz = shown.marker >= 0 ? shown.marker_hz : base_lo() + base_rate() / 4;
+    if (connected)
+        fm_hz = fm_inside(fm_hz, base_lo(), base_rate());
+    fm_win = window_open(FM_W, FM_H, "plutosa FM");
+    if (!fm_win) {
+        snprintf(status, sizeof(status), "cannot open the FM window");
+        failed = true;
+        redraw = true;
+        return;
+    }
+    fm_view = view_new(fm_win);
+    fm_edit.field = window_field_new(fm_win, 0, 0, EDIT_W);
+    fm_edit.editing = -1;
+    fm_edit.sequence = 0;
+    pthread_t events;
+    if (!fm_view || !fm_edit.field || view_layout(fm_view) < 0 ||
+        pthread_create(&events, 0, fm_events, 0) != 0) {
+        if (fm_edit.field)
+            window_field_free(fm_edit.field);
+        fm_edit.field = 0;
+        view_free(fm_view);
+        fm_view = 0;
+        window_close(fm_win);
+        fm_win = 0;
+        snprintf(status, sizeof(status), "cannot open the FM window: out of memory");
+        failed = true;
+        redraw = true;
+        return;
+    }
+    pthread_detach(events);
+    fm_shown.keys[0] = FM_KEYS[0];
+    fm_shown.keys[1] = FM_KEYS[1];
+    fm_shown.columns = 0;
+    fm_shown.marker = -1;
+    snprintf(fm_status, sizeof(fm_status), "narrow FM: waiting for samples");
+    fm_failed = false;
+    snprintf(fm_measure_line, sizeof(fm_measure_line), " ");
+    fm_values();
+    redraw = true;                              /* (the channel's band in the main window) */
+}
+
+/* The FM window's events, until it is closed (then it is closed here). */
+static void *fm_events(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&lock);
+    struct window *w = fm_win;
+    pthread_mutex_unlock(&lock);
+    struct window_event ev;
+    int px = -1, py = -1;
+    unsigned buttons = 0;
+    while (window_wait(w, &ev) && ev.type != WINDOW_CLOSED) {
+        pthread_mutex_lock(&lock);
+        double hz = 0;
+        bool pressed = false;
+        if (ev.type == WINDOW_POINTER) {
+            pressed = (ev.buttons & 1) && !(buttons & 1);
+            buttons = ev.buttons;
+            px = ev.x, py = ev.y;
+        }
+        bool sequence = ev.type == WINDOW_KEY && in_sequence(&fm_edit.sequence, ev.key);
+        if (field_event(&fm_edit, &ev, pressed)) {
+            /* (the edit box's) */
+        } else if (ev.type == WINDOW_KEY_DOWN) {
+            if (ev.key == WKEY_LEFT || ev.key == WKEY_RIGHT)
+                fm_hz += (ev.key == WKEY_RIGHT ? 1 : -1) * FM_STEP;
+            else if (ev.key == WKEY_UP || ev.key == WKEY_DOWN)
+                set_level(&fm_shown, fm_shown.ref_db + (ev.key == WKEY_UP ? LEVEL_STEP : -LEVEL_STEP));
+        } else if (ev.type == WINDOW_KEY && !sequence) {
+            if (connected && ((ev.key >= '0' && ev.key <= '9') || ev.key == '.')) {
+                edit_value(&fm_edit, VALUE_FM_FREQUENCY, true);
+                window_field_event(fm_edit.field, &ev);
+            } else if (ev.key == '+' || ev.key == '=') {
+                fm_set_volume(fm_volume + VOLUME_STEP);
+            } else if (ev.key == '-') {
+                fm_set_volume(fm_volume - VOLUME_STEP);
+            } else if (ev.key == 'b' || ev.key == 'B') {
+                fm_step_bandwidth(ev.key == 'b' ? 1 : -1);
+            } else if (ev.key == 'm') {
+                fm_shown.show_hold = !fm_shown.show_hold;
+            } else if (ev.key == 'r') {
+                fm_reset = true;
+            }
+        } else if (ev.type == WINDOW_POINTER) {
+            int k = pressed ? view_value_at(fm_view, &fm_shown, ev.x, ev.y) : -1;
+            if (pressed && view_button_at(fm_view, &fm_shown, ev.x, ev.y))
+                fm_reset = true;
+            else if (k >= 0 && connected)
+                edit_value(&fm_edit, VALUE_FM_FREQUENCY + k, false);
+        } else if (ev.type == WINDOW_DOUBLE_CLICK) {
+            enum view_place at = view_at(fm_view, &fm_shown, ev.x, ev.y, &hz);
+            if (fm_shown.rate > 0 && (at == VIEW_PLOT || at == VIEW_WATERFALL))
+                fm_hz = hz;
+        } else if (ev.type == WINDOW_SCROLL) {
+            enum view_place at = view_at(fm_view, &fm_shown, px, py, &hz);
+            if (at == VIEW_LEVELS)
+                set_level(&fm_shown, fm_shown.ref_db - ev.y * LEVEL_STEP);
+            else if (at == VIEW_PLOT || at == VIEW_WATERFALL)
+                fm_hz -= ev.y * FM_STEP;
+        } else if (ev.type == WINDOW_RESIZE) {
+            if (window_resize(w, ev.x, ev.y) == 0 && view_layout(fm_view) < 0)
+                printf("plutosa: out of memory for the FM window's new size\n");
+            fm_shown.columns = 0;
+        }
+        if (connected)
+            fm_hz = fm_inside(fm_hz, base_lo(), base_rate());
+        fm_values();
+        redraw = true;                          /* (the band in the main window) */
+        pthread_mutex_unlock(&lock);
+    }
+    pthread_mutex_lock(&lock);
+    window_field_free(fm_edit.field);
+    fm_edit.field = 0;
+    fm_edit.editing = -1;
+    view_free(fm_view);
+    fm_view = 0;
+    window_close(w);
+    fm_win = 0;
+    redraw = true;
+    pthread_mutex_unlock(&lock);
+    return 0;
 }
 
 /* The physical keys (WINDOW_KEY_DOWN): the arrows. */
@@ -870,7 +1342,7 @@ static void key_down(int key)
     if (key == WKEY_LEFT || key == WKEY_RIGHT)
         ask_lo(base_lo() + (key == WKEY_RIGHT ? 1 : -1) * base_rate() / 10);
     else if (key == WKEY_UP || key == WKEY_DOWN)
-        set_level(shown.ref_db + (key == WKEY_UP ? LEVEL_STEP : -LEVEL_STEP));
+        set_level(&shown, shown.ref_db + (key == WKEY_UP ? LEVEL_STEP : -LEVEL_STEP));
 }
 
 /* The keys' bytes (WINDOW_KEY): the letters, + and -. */
@@ -913,19 +1385,25 @@ static void key_typed(int key)
     case '-':
         ask_gain(-1);
         break;
+    case 'd':
+        fm_open(0);
+        break;
     }
 }
 
 int main(int argc, char **argv)
 {
     uri = DEFAULT_URI;
+    double fm_start = 0;
     for (int k = 1; k < argc; k++) {
         if (!strcmp(argv[k], "-p") && k + 1 < argc) {
             picture_file = argv[++k];
+        } else if (!strcmp(argv[k], "-f") && k + 1 < argc) {
+            fm_start = atof(argv[++k]) * 1e6;
         } else if (argv[k][0] != '-') {
             uri = argv[k];
         } else {
-            printf("usage: plutosa [URI] [-p FILE]\n");
+            printf("usage: plutosa [URI] [-p FILE] [-f MHZ]\n");
             return 2;
         }
     }
@@ -935,8 +1413,8 @@ int main(int argc, char **argv)
         return 1;
     }
     view = view_new(win);
-    field = window_field_new(win, 0, 0, EDIT_W);
-    if (!view || !field || view_layout(view) < 0) {
+    main_edit.field = window_field_new(win, 0, 0, EDIT_W);
+    if (!view || !main_edit.field || view_layout(view) < 0) {
         printf("plutosa: out of memory\n");
         return 1;
     }
@@ -945,16 +1423,23 @@ int main(int argc, char **argv)
     redraw = true;
     printf("plutosa: started, connecting to %s\n", uri);
 
-    pthread_t acquirer, analyser, drawer;
+    pthread_t acquirer, analyser, demodulator, drawer;
     if (pthread_create(&acquirer, 0, acquire_thread, 0) != 0 ||
         pthread_create(&analyser, 0, spectrum_thread, 0) != 0 ||
+        pthread_create(&demodulator, 0, fm_thread, 0) != 0 ||
         pthread_create(&drawer, 0, draw_thread, 0) != 0) {
         printf("plutosa: cannot start a thread\n");
         return 1;
     }
     pthread_detach(acquirer);
     pthread_detach(analyser);
+    pthread_detach(demodulator);
     pthread_detach(drawer);
+    if (fm_start > 0) {
+        pthread_mutex_lock(&lock);
+        fm_open(fm_start);
+        pthread_mutex_unlock(&lock);
+    }
 
     struct window_event ev;
     int px = -1, py = -1;               /* where the pointer is (the wheel's place) */
@@ -968,8 +1453,8 @@ int main(int argc, char **argv)
             buttons = ev.buttons;
             px = ev.x, py = ev.y;
         }
-        bool sequence = ev.type == WINDOW_KEY && in_sequence(ev.key);
-        if (field_event(&ev, pressed)) {
+        bool sequence = ev.type == WINDOW_KEY && in_sequence(&main_edit.sequence, ev.key);
+        if (field_event(&main_edit, &ev, pressed)) {
             /* (the edit box's) */
         } else if (ev.type == WINDOW_KEY_DOWN) {
             /* (the receiver's keys wait for a connection: its ranges) */
@@ -977,15 +1462,23 @@ int main(int argc, char **argv)
                 key_down(ev.key);
         } else if (ev.type == WINDOW_KEY && !sequence) {
             if (connected && ((ev.key >= '0' && ev.key <= '9') || ev.key == '.')) {
-                edit_value(VALUE_LO, true);     /* a frequency typed: the LO's box */
-                window_field_event(field, &ev);
+                edit_value(&main_edit, VALUE_LO, true);   /* a frequency typed: the LO's box */
+                window_field_event(main_edit.field, &ev);
             } else if (connected || !strchr("sSbBg+=-", ev.key)) {
                 key_typed(ev.key);
             }
         } else if (ev.type == WINDOW_POINTER) {
             int k = pressed ? view_value_at(view, &shown, ev.x, ev.y) : -1;
-            if (k >= 0 && connected)
-                edit_value(k, false);
+            enum view_place at = pressed ? view_at(view, &shown, ev.x, ev.y, &hz) : VIEW_ELSEWHERE;
+            if (pressed && view_button_at(view, &shown, ev.x, ev.y)) {
+                fm_open(0);
+            } else if (k >= 0 && connected) {
+                edit_value(&main_edit, k, false);
+            } else if (fm_win && connected && shown.rate > 0 &&
+                       (at == VIEW_PLOT || at == VIEW_WATERFALL)) {
+                fm_hz = fm_inside(hz, base_lo(), base_rate());     /* (the FM channel there) */
+                fm_values();
+            }
         } else if (ev.type == WINDOW_DOUBLE_CLICK) {
             enum view_place at = view_at(view, &shown, ev.x, ev.y, &hz);
             if (connected && shown.rate > 0 && (at == VIEW_PLOT || at == VIEW_WATERFALL))
@@ -994,7 +1487,7 @@ int main(int argc, char **argv)
             /* Up (negative steps): higher in frequency, or the level. */
             enum view_place at = view_at(view, &shown, px, py, &hz);
             if (at == VIEW_LEVELS)
-                set_level(shown.ref_db - ev.y * LEVEL_STEP);
+                set_level(&shown, shown.ref_db - ev.y * LEVEL_STEP);
             else if (connected && (at == VIEW_PLOT || at == VIEW_WATERFALL))
                 ask_lo(base_lo() - ev.y * base_rate() / 10);
         } else if (ev.type == WINDOW_RESIZE) {

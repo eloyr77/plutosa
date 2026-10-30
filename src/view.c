@@ -31,7 +31,7 @@ struct view {
     int py0, ph;                /* the plot's rows */
     int wy0, wh;                /* the waterfall's rows */
     uint32_t *wf;               /* the waterfall, pw x wh, newest row first */
-    uint32_t bg, panel, grid, text, dim, trace, fill, hold, marker, bad, value;
+    uint32_t bg, panel, grid, text, dim, trace, fill, hold, marker, bad, value, band, edge;
     uint32_t heat[256];         /* the waterfall's colors, weakest first */
 };
 
@@ -60,6 +60,8 @@ struct view *view_new(struct window *win)
     v->marker = window_rgb(win, 0xFF, 0xFF, 0xFF);
     v->bad = window_rgb(win, 0xBF, 0x61, 0x6A);
     v->value = window_rgb(win, 0x88, 0xC0, 0xD0);
+    v->band = window_rgb(win, 0x1F, 0x2D, 0x3E);
+    v->edge = window_rgb(win, 0x4C, 0x6A, 0x88);
     int last = (int)(sizeof(HEAT) / sizeof(HEAT[0])) - 1;
     for (int k = 0, s = 0; k < 256; k++) {
         double t = k / 255.0;
@@ -75,6 +77,15 @@ struct view *view_new(struct window *win)
                                 (int)(HEAT[s].b + f * (HEAT[s + 1].b - HEAT[s].b)));
     }
     return v;
+}
+
+void view_free(struct view *v)
+{
+    if (!v)
+        return;
+    free(v->px);
+    free(v->wf);
+    free(v);
 }
 
 int view_layout(struct view *v)
@@ -230,28 +241,51 @@ static void draw_axes(struct view *v, const struct view_data *d)
     }
     int ay = v->py0 + v->ph + 4;
     text(v, 8, ay, "dBFS", v->dim);
-    /* Frequency: round steps about 100 pixels apart, in MHz; "MHz" at the
-     * right end, where no label may reach. */
+    /* Frequency: round steps about 100 pixels apart, in MHz (or kHz from
+     * lo, from lo's tick on); the unit at the right end, where no label
+     * may reach. */
     if (d->rate <= 0)
         return;
     double left = d->lo - d->rate / 2, fstep = tick_step(d->rate * 100 / v->pw);
-    int decimals = fstep >= 1e6 ? 0 : (int)ceil(-log10(fstep / 1e6) - 1e-9);
+    double unit = d->offsets ? 1e3 : 1e6, base = d->offsets ? d->lo : 0;
+    int decimals = fstep >= unit ? 0 : (int)ceil(-log10(fstep / unit) - 1e-9);
     if (decimals > 6)
         decimals = 6;
-    int unit_x = v->x0 + v->pw - text_width(v, "MHz");
-    for (double f = ceil(left / fstep) * fstep; f <= left + d->rate; f += fstep) {
+    const char *unit_name = d->offsets ? "kHz" : "MHz";
+    int unit_x = v->x0 + v->pw - text_width(v, unit_name);
+    for (double f = base + ceil((left - base) / fstep) * fstep; f <= left + d->rate; f += fstep) {
         int x = v->x0 + (int)floor((f - left) / d->rate * v->pw);   /* (as view_at) */
         if (x >= v->x0 + v->pw)
             break;
         rect(v, x, v->py0, 1, v->ph, v->grid);
-        snprintf(label, sizeof(label), "%.*f", decimals, f / 1e6);
+        double shown_f = (f - base) / unit;
+        snprintf(label, sizeof(label), d->offsets && shown_f > 0.5 * fstep / unit ? "+%.*f" : "%.*f",
+                 decimals, fabs(shown_f) < 0.5 * fstep / unit ? 0.0 : shown_f);
         int lw = text_width(v, label), lx = x - lw / 2;
         if (lx < v->x0)
             lx = v->x0;
         if (lx + lw < unit_x - 8)
             text(v, lx, ay, label, v->dim);
     }
-    text(v, unit_x, ay, "MHz", v->dim);
+    text(v, unit_x, ay, unit_name, v->dim);
+}
+
+/* The band (d->band_lo..band_hi) on the plot: shaded, its edges lined. */
+static void draw_band(struct view *v, const struct view_data *d)
+{
+    if (!(d->band_hi > d->band_lo) || d->rate <= 0)
+        return;
+    double left = d->lo - d->rate / 2;
+    int x1 = v->x0 + (int)floor((d->band_lo - left) / d->rate * v->pw);
+    int x2 = v->x0 + (int)floor((d->band_hi - left) / d->rate * v->pw);
+    if (x2 < v->x0 || x1 >= v->x0 + v->pw)
+        return;
+    int a = x1 < v->x0 ? v->x0 : x1, b = x2 >= v->x0 + v->pw ? v->x0 + v->pw - 1 : x2;
+    rect(v, a, v->py0, b - a + 1, v->ph, v->band);
+    if (x1 >= v->x0)
+        rect(v, x1, v->py0, 1, v->ph, v->edge);
+    if (x2 < v->x0 + v->pw)
+        rect(v, x2, v->py0, 1, v->ph, v->edge);
 }
 
 /* A trace: per pixel column the level, joined to the last column's; with
@@ -299,6 +333,34 @@ static void draw_waterfall(struct view *v, const struct view_data *d, bool new_r
                (size_t)v->pw * sizeof(uint32_t));
 }
 
+/* The button's place: x, y, w, h (w 0: none). */
+static void button_place(const struct view *v, const struct view_data *d, int *x, int *y, int *w,
+                         int *h)
+{
+    *w = d->button ? text_width(v, d->button) + 16 : 0;
+    *h = LINE_H;
+    *x = v->w - RIGHT - *w;
+    *y = TEXT_Y + d->button_line * LINE_H - 1;
+}
+
+static void draw_button(struct view *v, const struct view_data *d)
+{
+    int x, y, w, h;
+    button_place(v, d, &x, &y, &w, &h);
+    if (!w)
+        return;
+    rect(v, x, y, w, h, v->edge);
+    rect(v, x + 1, y + 1, w - 2, h - 2, v->band);
+    text(v, x + 8, y + (h - wfont_height(v->font)) / 2, d->button, v->value);
+}
+
+bool view_button_at(const struct view *v, const struct view_data *d, int x, int y)
+{
+    int bx, by, w, h;
+    button_place(v, d, &bx, &by, &w, &h);
+    return w && x >= bx && x < bx + w && y >= by && y < by + h;
+}
+
 void view_draw(struct view *v, const struct view_data *d, bool new_row)
 {
     if (!v->px)
@@ -307,7 +369,9 @@ void view_draw(struct view *v, const struct view_data *d, bool new_row)
     for (int i = 0; i < 3; i++)
         if (d->lines[i])
             draw_line(v, d, i, i == 0 ? (d->failed ? v->bad : v->trace) : v->text);
+    draw_button(v, d);
     rect(v, v->x0, v->py0, v->pw, v->ph, v->panel);
+    draw_band(v, d);
     draw_axes(v, d);
     if (d->columns > 0) {
         if (d->show_hold)

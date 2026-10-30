@@ -31,11 +31,16 @@ struct view_data {
     struct view_value values[VIEW_VALUES];
     bool failed;                    /* line 0 tells of a failure: in red */
     double ref_db, range_db;        /* the dB axis: ref_db at the top, range_db down */
+    double band_lo, band_hi;        /* Hz: a band shaded on the plot (when band_hi > band_lo) */
+    bool offsets;                   /* the frequency axis in kHz from lo (else MHz) */
+    const char *button;             /* a button at the right end of text line button_line (0: none) */
+    int button_line;
     const char *keys[2];            /* the lines at the bottom */
 };
 
 struct view;
 struct view *view_new(struct window *win);
+void view_free(struct view *v);
 
 /* Fits the view to the window's size (at the start and after
  * window_resize; the waterfall starts again): 0, or -1 out of memory. */
@@ -51,6 +56,9 @@ void view_draw(struct view *v, const struct view_data *d, bool new_row);
 
 /* The value at (x, y) in the window: its index in d->values, or -1. */
 int view_value_at(const struct view *v, const struct view_data *d, int x, int y);
+
+/* Whether (x, y) in the window is on the button. */
+bool view_button_at(const struct view *v, const struct view_data *d, int x, int y);
 
 /* Where an edit box `height` pixels tall goes over value k: at (*x, *y),
  * *w wide (the value's width, at least min_w). */
