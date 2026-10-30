@@ -20,7 +20,7 @@
 APP      := plutosa
 KIND     := apps
 LIBIIO   := libiio/src/iio.c libiio/src/iioxml.c libiio/src/iionet.c
-SRCS     := src/plutosa.c src/dsp.c src/radio.c src/view.c $(LIBIIO)
+SRCS     := src/plutosa.c src/dsp.c src/demod.c src/radio.c src/view.c $(LIBIIO)
 CFLAGS   += -Werror -Ilibiio/include
 
 ifeq ($(wildcard libiio/include/iio.h),)
@@ -31,10 +31,15 @@ ifneq ($(wildcard /system/sdk/ritteros.mk),)
 # On the RitterOS machine.
 include /system/sdk/ritteros.mk
 
-# The spectrum's test, built with the machine's cc and C library.
+# The spectrum's and the demodulator's tests, built with the machine's cc
+# and C library.
 build/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
 	@mkdir -p build
 	cc -Werror -Isrc -o $@ tests/dsptest.c src/dsp.c
+
+build/demodtest: tests/demodtest.c src/demod.c src/demod.h
+	@mkdir -p build
+	cc -Werror -Isrc -o $@ tests/demodtest.c src/demod.c
 
 # radio.c on the real Pluto (ARGS: another URI).
 build/radiotest: tests/radiotest.c src/radio.c src/radio.h $(LIBIIO)
@@ -42,19 +47,28 @@ build/radiotest: tests/radiotest.c src/radio.c src/radio.h $(LIBIIO)
 	cc -Werror -Isrc -Ilibiio/include -o $@ tests/radiotest.c src/radio.c $(LIBIIO)
 
 .PHONY: check check-radio
-check: build/dsptest
+check: build/dsptest build/demodtest
 	build/dsptest
+	build/demodtest
 
 check-radio: build/radiotest
 	build/radiotest $(ARGS)
+
+build/streamtest: tests/streamtest.c src/radio.c src/radio.h src/dsp.c src/dsp.h $(LIBIIO)
+	cc -Werror -Isrc -Ilibiio/include -o $@ tests/streamtest.c src/radio.c src/dsp.c $(LIBIIO)
+
+.PHONY: measure
+measure: build/streamtest
+	build/streamtest $(ARGS)
 else
 # On another computer: only the app's code goes over, and make runs there.
 REMOTE_DIR ?= /home/root/plutosa
+ARCH ?= x86_64
 CODE := Makefile src tests libiio/include libiio/src
 SSH  := ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(SSH_OPTS)
 need_host = $(if $(HOST),,$(error set HOST=user@address, e.g. make $@ HOST=root@192.168.0.195))
 
-.PHONY: all push deploy run stop clean
+.PHONY: all push deploy upload run stop clean
 all: push
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make'
 
@@ -65,8 +79,21 @@ push:
 	$(need_host)
 	COPYFILE_DISABLE=1 tar cf - $(CODE) | $(SSH) $(HOST) 'mkdir -p $(REMOTE_DIR) && tar xmf - -C $(REMOTE_DIR)'
 
+# deploy also brings the program back to dist/ARCH (git-ignored), for upload.
 deploy: push
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make deploy'
+	@mkdir -p dist/$(ARCH)
+	$(SSH) $(HOST) 'cat $(REMOTE_DIR)/build/$(ARCH)/$(APP)' > dist/$(ARCH)/$(APP).new
+	mv dist/$(ARCH)/$(APP).new dist/$(ARCH)/$(APP)
+
+# The program last deployed, installed as it is (a fresh system: no sources,
+# no build). The shared libraries stay compatible, so it runs on newer
+# systems too; on an older one ld.so may refuse it ("needs FUNCTION"):
+# make deploy then.
+upload:
+	$(need_host)
+	@test -f dist/$(ARCH)/$(APP) || { echo "no dist/$(ARCH)/$(APP): make deploy first"; exit 1; }
+	$(SSH) $(HOST) 'cat > /system/$(ARCH)/apps/$(APP).new && chmod 755 /system/$(ARCH)/apps/$(APP).new && mv /system/$(ARCH)/apps/$(APP).new /system/$(ARCH)/apps/$(APP)' < dist/$(ARCH)/$(APP)
 
 # A windowed app keeps the session open until its window closes: run it in
 # the background here.
@@ -82,20 +109,31 @@ clean:
 	$(need_host)
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make clean'
 
-# The spectrum's arithmetic (src/dsp.c, plain C) checked here, on this
-# computer, with its own compiler and sanitizers: no machine needed.
+# The spectrum's and the demodulator's arithmetic (src/dsp.c, src/demod.c,
+# plain C) checked here, on this computer, with its own compiler and
+# sanitizers: no machine needed.
 HOST_CC := cc -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror
 build/host/dsptest: tests/dsptest.c src/dsp.c src/dsp.h
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -Isrc -o $@ tests/dsptest.c src/dsp.c -lm
 
 .PHONY: check check-machine check-radio
-check: build/host/dsptest
+build/host/demodtest: tests/demodtest.c src/demod.c src/demod.h
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -Isrc -o $@ tests/demodtest.c src/demod.c -lm
+
+check: build/host/dsptest build/host/demodtest
 	build/host/dsptest
+	build/host/demodtest
 
 check-machine: push
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make check'
 
 check-radio: push
 	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make check-radio ARGS="$(ARGS)"'
+
+# How many of the Pluto's samples the link carries (tests/streamtest.c).
+.PHONY: measure
+measure: push
+	$(SSH) $(HOST) 'cd $(REMOTE_DIR) && make measure ARGS="$(ARGS)"'
 endif

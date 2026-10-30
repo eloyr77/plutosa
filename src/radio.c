@@ -50,6 +50,11 @@ void radio_read(const struct radio *r, struct receiver *out)
     if (out->lo_range.known)
         out->lo_range.min = ceil(out->lo_range.min / 1e6) * 1e6;
     out->rate_range = read_range(r->rx, "sampling_frequency_available");
+    /* Likewise its lowest rate: 2083333 (25 MHz / 12, rounded down) is
+     * "Invalid argument", 12 times it being under the ADC's 25 MHz; the
+     * rate starts at the next whole Hz up. */
+    if (out->rate_range.known)
+        out->rate_range.min = floor(out->rate_range.min) + 1;
     out->bandwidth_range = read_range(r->rx, "rf_bandwidth_available");
     out->gain_range = read_range(r->rx, "hardwaregain_available");
 }

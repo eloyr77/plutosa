@@ -88,6 +88,12 @@ int main(int argc, char **argv)
     radio_read(&radio, &r);
     near("clamped to the range's bottom (its next whole MHz)", r.lo, before.lo_range.min, 1e-6);
 
+    /* The lowest rate (its reported bottom is refused: radio.c starts one
+     * Hz up). */
+    check(radio_set_rate(&radio, &before, 1) == 0, "a rate of 1 Hz asked", 0, 0);
+    radio_read(&radio, &r);
+    near("clamped to the range's bottom", r.rate, before.rate_range.min, 1e-6);
+
     /* Everything back: the rate, the bandwidth, the LO, then the gain mode
      * (and the gain, if it was manual). */
     radio_set_rate(&radio, &before, before.rate);

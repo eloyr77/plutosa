@@ -31,7 +31,7 @@ struct view {
     int py0, ph;                /* the plot's rows */
     int wy0, wh;                /* the waterfall's rows */
     uint32_t *wf;               /* the waterfall, pw x wh, newest row first */
-    uint32_t bg, panel, grid, text, dim, trace, fill, hold, marker, bad;
+    uint32_t bg, panel, grid, text, dim, trace, fill, hold, marker, bad, value;
     uint32_t heat[256];         /* the waterfall's colors, weakest first */
 };
 
@@ -59,6 +59,7 @@ struct view *view_new(struct window *win)
     v->hold = window_rgb(win, 0xC9, 0xA3, 0x5A);
     v->marker = window_rgb(win, 0xFF, 0xFF, 0xFF);
     v->bad = window_rgb(win, 0xBF, 0x61, 0x6A);
+    v->value = window_rgb(win, 0x88, 0xC0, 0xD0);
     int last = (int)(sizeof(HEAT) / sizeof(HEAT[0])) - 1;
     for (int k = 0, s = 0; k < 256; k++) {
         double t = k / 255.0;
@@ -151,9 +152,57 @@ static int text(struct view *v, int x, int y, const char *s, uint32_t c)
                       WFONT_TRANSPARENT);
 }
 
-static int text_width(struct view *v, const char *s)
+static int text_width(const struct view *v, const char *s)
 {
     return wfont_text_width(v->font, s);
+}
+
+/* The width of bytes start..end of s. */
+static int part_width(const struct view *v, const char *s, int start, int end)
+{
+    char part[256];
+    int n = end - start;
+    if (n <= 0)
+        return 0;
+    if (n >= (int)sizeof(part))
+        n = (int)sizeof(part) - 1;
+    memcpy(part, s + start, (size_t)n);
+    part[n] = 0;
+    return text_width(v, part);
+}
+
+/* A text line, its values in their own color and underlined. */
+static void draw_line(struct view *v, const struct view_data *d, int i, uint32_t c)
+{
+    const char *s = d->lines[i];
+    int y = TEXT_Y + i * LINE_H, x = TEXT_X, at = 0, len = (int)strlen(s);
+    char part[256];
+    while (at < len) {
+        /* The next value on this line from `at`, if any. */
+        int next = -1;
+        for (int k = 0; k < VIEW_VALUES; k++) {
+            const struct view_value *val = &d->values[k];
+            if (val->line == i && val->end > val->start && val->start >= at && val->end <= len &&
+                (next < 0 || val->start < d->values[next].start))
+                next = k;
+        }
+        int start = next < 0 ? len : d->values[next].start;
+        int end = next < 0 ? len : d->values[next].end;
+        for (int piece = 0; piece < 2; piece++) {
+            int from = piece ? start : at, to = piece ? end : start, n = to - from;
+            if (n <= 0)
+                continue;
+            if (n >= (int)sizeof(part))
+                n = (int)sizeof(part) - 1;
+            memcpy(part, s + from, (size_t)n);
+            part[n] = 0;
+            int x1 = text(v, x, y, part, piece ? v->value : c);
+            if (piece)
+                rect(v, x, y + wfont_height(v->font), x1 - x, 1, v->grid);
+            x = x1;
+        }
+        at = end;
+    }
 }
 
 /* The row of a level in the plot (clamped to it). */
@@ -257,8 +306,7 @@ void view_draw(struct view *v, const struct view_data *d, bool new_row)
     rect(v, 0, 0, v->w, v->h, v->bg);
     for (int i = 0; i < 3; i++)
         if (d->lines[i])
-            text(v, TEXT_X, TEXT_Y + i * LINE_H, d->lines[i],
-                 i == 0 ? (d->failed ? v->bad : v->trace) : v->text);
+            draw_line(v, d, i, i == 0 ? (d->failed ? v->bad : v->trace) : v->text);
     rect(v, v->x0, v->py0, v->pw, v->ph, v->panel);
     draw_axes(v, d);
     if (d->columns > 0) {
@@ -273,7 +321,37 @@ void view_draw(struct view *v, const struct view_data *d, bool new_row)
         if (d->keys[i])
             text(v, TEXT_X, v->h - KEYS_H + 4 + i * LINE_H, d->keys[i], v->dim);
     window_blit(v->win, 0, 0, v->w, v->h, v->px);
-    window_flush(v->win);
+}
+
+/* Value k's text in the window: x, y and its width (0: not shown). */
+static int value_place(const struct view *v, const struct view_data *d, int k, int *x, int *y)
+{
+    const struct view_value *val = &d->values[k];
+    const char *s = val->line >= 0 && val->line < 3 ? d->lines[val->line] : 0;
+    if (!s || val->end <= val->start || val->end > (int)strlen(s))
+        return 0;
+    *x = TEXT_X + part_width(v, s, 0, val->start);
+    *y = TEXT_Y + val->line * LINE_H;
+    return part_width(v, s, val->start, val->end);
+}
+
+int view_value_at(const struct view *v, const struct view_data *d, int x, int y)
+{
+    for (int k = 0; k < VIEW_VALUES; k++) {
+        int vx, vy, w = value_place(v, d, k, &vx, &vy);
+        if (w > 0 && x >= vx - 2 && x < vx + w + 2 && y >= vy - 2 && y < vy + LINE_H - 2)
+            return k;
+    }
+    return -1;
+}
+
+void view_value_box(const struct view *v, const struct view_data *d, int k, int height, int min_w,
+                    int *x, int *y, int *w)
+{
+    int vx = TEXT_X, vy = TEXT_Y, vw = value_place(v, d, k, &vx, &vy);
+    *x = vx - 4;
+    *y = vy + (wfont_height(v->font) - height) / 2;
+    *w = (vw + 8 > min_w ? vw + 8 : min_w);
 }
 
 enum view_place view_at(const struct view *v, const struct view_data *d, int x, int y,
