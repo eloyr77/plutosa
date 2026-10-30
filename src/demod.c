@@ -16,6 +16,10 @@
 #define AUDIO_CUT    4000.0         /* Hz: the audio low-pass */
 #define DC_CUT       50.0           /* Hz: what the DC removal takes away below */
 #define RENORMALIZE  1024           /* the oscillator kept on the unit circle this often */
+#define SQUELCH_TIME 0.005          /* s: the level the squelch looks at is averaged over this */
+#define SQUELCH_GAP  0.5            /* it closes below the threshold times this (3 dB) */
+#define SQUELCH_HOLD 0.05           /* s: and only after so long below */
+#define SQUELCH_FADE 0.005          /* s: the audio fades in and out over this */
 
 struct demod {
     double rate, channel_rate;
@@ -43,6 +47,12 @@ struct demod {
     float ha[2 * DEMOD_AUDIO_TAPS];
     int audio_pos;
     double a0, t;                   /* the last audio sample; the next output's place after it */
+    /* The squelch: the threshold (0: off), the averaged level, whether
+     * open, how long below (channel samples), the audio's gain (0..1). */
+    double squelch, level, level_a;
+    bool open;
+    long below, hold;
+    double gain, fade;
 };
 
 /* A low-pass of `count` taps (odd) cutting at `cut` of the sample rate:
@@ -81,6 +91,11 @@ struct demod *demod_new(double rate, double offset, double bandwidth)
     d->pace = 1;
     d->pr = 1;
     d->dc_a = 1 - 2 * M_PI * DC_CUT / d->channel_rate;
+    d->level_a = 1 - exp(-1 / (SQUELCH_TIME * d->channel_rate));
+    d->open = true;
+    d->hold = lround(SQUELCH_HOLD * d->channel_rate);
+    d->gain = 1;
+    d->fade = 1 / (SQUELCH_FADE * d->channel_rate);
     low_pass(d->audio_taps, DEMOD_AUDIO_TAPS, AUDIO_CUT / d->channel_rate);
     demod_tune(d, offset, bandwidth);
     return d;
@@ -109,6 +124,16 @@ void demod_tune(struct demod *d, double offset, double bandwidth)
 void demod_volume(struct demod *d, double volume)
 {
     d->volume = volume < 0 ? 0 : volume;
+}
+
+void demod_squelch(struct demod *d, double level)
+{
+    d->squelch = level > 0 ? level : 0;
+}
+
+bool demod_squelch_open(const struct demod *d)
+{
+    return d->open;
 }
 
 void demod_pace(struct demod *d, double pace)
@@ -181,8 +206,22 @@ static void channel_sample(struct demod *d, float cr, float ci, struct demod_out
     pos = d->pos;
     float yi = fir(d->taps, DEMOD_TAPS, d->hi, &pos, ci);
     d->pos = pos;
-    *power += (double)yr * yr + (double)yi * yi;
+    double p = (double)yr * yr + (double)yi * yi;
+    *power += p;
     (*filtered)++;
+    /* The squelch: open above the threshold, closed after SQUELCH_HOLD
+     * below SQUELCH_GAP of it; the gain follows in SQUELCH_FADE. */
+    d->level += d->level_a * (p - d->level);
+    if (d->squelch <= 0 || d->level > d->squelch) {
+        d->open = true;
+        d->below = 0;
+    } else if (d->level < d->squelch * SQUELCH_GAP) {
+        if (d->open && ++d->below >= d->hold)
+            d->open = false;
+    } else {
+        d->below = 0;
+    }
+    d->gain = d->open ? fmin(1, d->gain + d->fade) : fmax(0, d->gain - d->fade);
     /* The phase from the last sample to this one: y times the last's
      * conjugate. */
     double hz = 0;
@@ -197,7 +236,7 @@ static void channel_sample(struct demod *d, float cr, float ci, struct demod_out
     d->dc_out = x - d->dc_in + d->dc_a * d->dc_out;
     d->dc_in = x;
     float a = fir(d->audio_taps, DEMOD_AUDIO_TAPS, d->ha, &d->audio_pos, (float)d->dc_out);
-    audio_out(d, a, out);
+    audio_out(d, a * d->gain, out);
 }
 
 /* The nearest integer of v (the integers' rounding, without the library's). */

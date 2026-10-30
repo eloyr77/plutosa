@@ -1,7 +1,7 @@
 /*
  * plutosa: a spectrum analyzer for the ADALM-Pluto on RitterOS.
  *
- * Four threads. The acquisition thread connects to the Pluto's iiod
+ * The threads. The acquisition thread connects to the Pluto's iiod
  * (libiio's network backend, ip:192.168.2.1 by default), reads what the
  * receiver is set to (radio.c), then reads blocks of I/Q samples from
  * cf-ad9361-lpc one after another and does nothing else, so that as few
@@ -12,7 +12,10 @@
  * makes it FFT frames (dsp.c), and the averaged spectrum, reduced to the
  * plot's pixel columns, is handed to the drawing thread, which draws at
  * most PICTURES a second (view.c): the text, the spectrum with its marker,
- * the waterfall.
+ * the waterfall. While the FM window is open (key d), the FM thread
+ * takes every block in order through the demodulator (demod.c) and the
+ * sound thread plays its audio through /dev/pcm0; the FM window has an
+ * events thread of its own.
  * The main thread reads the window's events (the keys and the mouse, see
  * KEYS; a click on a value in the text opens the SDK's text field over it
  * to type a new one): changes to the receiver become a request that the
@@ -23,6 +26,7 @@
  * look at it from elsewhere.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -71,6 +75,9 @@ PROGRAM_HELP("plutosa [URI] [-p FILE] [-f MHZ]",
 #define FM_MIN_BANDWIDTH 1000.0
 #define FM_MAX_VOLUME 4.0           /* 400% */
 #define VOLUME_STEP 0.1
+#define SQUELCH_STEP 3.0            /* dB, s and S */
+#define FM_MIN_SQUELCH -130.0       /* dBFS */
+#define FM_MAX_SQUELCH 0.0
 #define CHANNEL_MAX 8192            /* channel samples a block makes, at most */
 
 /* What the keys choose from. */
@@ -90,14 +97,14 @@ static const char *const KEYS[2] = {
 };
 static const char *const FM_KEYS[2] = {     /* (80 characters at most: the window's width) */
     "click a value or type MHz  arrows/wheel: tune 0.5 kHz, level  double-click: tune",
-    "+/- volume  b/B bandwidth  m max hold  r reset  (main window: a click tunes)",
+    "+/- volume  b/B bandwidth  s/S squelch  m max hold  r reset  main: click tunes",
 };
 
 /* The values a click on the text edits, typed in their unit: the main
- * window's (its view_data's values 0-3) and the FM window's (its 0-2). */
+ * window's (its view_data's values 0-3) and the FM window's (its 0-3). */
 enum {
     VALUE_LO, VALUE_SPAN, VALUE_BANDWIDTH, VALUE_GAIN,
-    VALUE_FM_FREQUENCY, VALUE_FM_BANDWIDTH, VALUE_FM_VOLUME, VALUES_COUNT
+    VALUE_FM_FREQUENCY, VALUE_FM_BANDWIDTH, VALUE_FM_VOLUME, VALUE_FM_SQUELCH, VALUES_COUNT
 };
 static const struct { const char *name, *unit; double scale; } VALUES[VALUES_COUNT] = {
     [VALUE_LO] = { "LO", "MHz", 1e6 },
@@ -107,6 +114,7 @@ static const struct { const char *name, *unit; double scale; } VALUES[VALUES_COU
     [VALUE_FM_FREQUENCY] = { "FM frequency", "MHz", 1e6 },
     [VALUE_FM_BANDWIDTH] = { "FM bandwidth", "kHz", 1e3 },
     [VALUE_FM_VOLUME] = { "volume", "%", 0.01 },
+    [VALUE_FM_SQUELCH] = { "squelch", "dBFS", 1 },
 };
 #define EDIT_W      120             /* the edit box's width at least, pixels */
 
@@ -166,6 +174,8 @@ static struct window *fm_win;
 static struct view *fm_view;
 static struct editor fm_edit = { .editing = -1 };
 static double fm_hz, fm_bandwidth = 12500, fm_volume = 0.3;   /* (FM's hiss without a signal is loud) */
+static bool fm_squelch_on;          /* the squelch, at fm_squelch dBFS (the channel's level) */
+static double fm_squelch, fm_level = -60;          /* dBFS; the level the last measured */
 static char fm_status[200], fm_values_line[200], fm_measure_line[200];
 static bool fm_failed, fm_fresh, fm_redraw;
 static float fm_average[VIEW_MAX_COLUMNS], fm_hold[VIEW_MAX_COLUMNS];
@@ -633,6 +643,151 @@ static void *spectrum_thread(void *arg)
     return 0;
 }
 
+/* --- The sound: the FM audio to /dev/pcm0 --- */
+
+/* The FM thread puts its audio into a buffer of our own and never waits
+ * for the sound card; the sound thread writes it to /dev/pcm0 in pieces
+ * (a write waits while the card's ring is full: the card's clock sets the
+ * pace). The Pluto's clock and the card's differ a little, so the buffer
+ * would fill up or run dry: the demodulator's resampler is paced to keep
+ * it at SOUND_TARGET. Run dry (blocks lost), silence is written instead
+ * (the card's ring never empties) until the buffer is at SOUND_TARGET
+ * again; overflowing, the newest audio is dropped. Its own lock:
+ * sound_lock is taken inside `lock`, never the other way round. */
+#define SOUND_FRAMES 24000          /* the buffer's room: 0.5 s at 48 kHz */
+#define SOUND_TARGET 4800           /* frames kept in it: 100 ms */
+#define SOUND_PIECE  480            /* frames a write: 10 ms */
+#define SOUND_PACE_S 1.0            /* the pace is set again this often */
+#define SOUND_GAIN   0.002          /* the pace's change for the buffer a whole SOUND_TARGET off */
+#define SOUND_PACE   0.005          /* the pace's furthest from 1 */
+
+static pthread_mutex_t sound_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sound_wake = PTHREAD_COND_INITIALIZER;
+static bool sound_wanted;           /* the FM window is open */
+static int16_t sound_buffer[2 * SOUND_FRAMES];
+static int sound_head, sound_fill;  /* frames: the oldest's place, how many */
+static bool sound_playing;          /* (else silence until sound_fill reaches SOUND_TARGET) */
+static bool sound_played;           /* since the window opened (silence before is no gap) */
+static double sound_pace = 1, sound_level = -1;   /* the level: ms in the buffer, -1 unknown */
+static long sound_silent, sound_dropped;          /* frames since the FM window's reset */
+static char sound_error[120];       /* /dev/pcm0 refused (empty: none) */
+
+/* The FM window opened (true) or closed. */
+static void sound_want(bool on)
+{
+    pthread_mutex_lock(&sound_lock);
+    sound_wanted = on;
+    pthread_cond_broadcast(&sound_wake);
+    pthread_mutex_unlock(&sound_lock);
+}
+
+/* The FM thread's audio into the buffer (the newest dropped when full). */
+static void sound_put(const int16_t *audio, int frames)
+{
+    pthread_mutex_lock(&sound_lock);
+    int room = SOUND_FRAMES - sound_fill;
+    if (frames > room) {
+        sound_dropped += frames - room;
+        frames = room;
+    }
+    for (int k = 0; k < frames; k++) {
+        int at = (sound_head + sound_fill + k) % SOUND_FRAMES;
+        sound_buffer[2 * at] = audio[2 * k];
+        sound_buffer[2 * at + 1] = audio[2 * k + 1];
+    }
+    sound_fill += frames;
+    pthread_mutex_unlock(&sound_lock);
+}
+
+static int write_all(int fd, const void *p, size_t n)
+{
+    const char *b = p;
+    while (n > 0) {
+        ssize_t w = write(fd, b, n);
+        if (w <= 0)
+            return -1;
+        b += w, n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* While the FM window is open: /dev/pcm0 open, a piece written after
+ * another, the pace set from the buffer's mean level. */
+static void *sound_thread(void *arg)
+{
+    (void)arg;
+    static int16_t piece[2 * SOUND_PIECE];
+    for (;;) {
+        pthread_mutex_lock(&sound_lock);
+        while (!sound_wanted)
+            pthread_cond_wait(&sound_wake, &sound_lock);
+        sound_head = sound_fill = 0;
+        sound_playing = sound_played = false;
+        sound_pace = 1, sound_level = -1;
+        pthread_mutex_unlock(&sound_lock);
+        int fd = open("/dev/pcm0", O_WRONLY);
+        if (fd < 0) {
+            pthread_mutex_lock(&sound_lock);
+            snprintf(sound_error, sizeof(sound_error), "/dev/pcm0: %s", strerror(errno));
+            while (sound_wanted)                /* (tried again when the window opens again) */
+                pthread_cond_wait(&sound_wake, &sound_lock);
+            pthread_mutex_unlock(&sound_lock);
+            continue;
+        }
+        double level = 0, since = now_s();
+        int levels = 0;
+        for (;;) {
+            pthread_mutex_lock(&sound_lock);
+            if (!sound_wanted) {
+                pthread_mutex_unlock(&sound_lock);
+                break;
+            }
+            sound_error[0] = 0;
+            if (sound_playing && sound_fill < SOUND_PIECE)
+                sound_playing = false;          /* (run dry: silence until it is full again) */
+            else if (!sound_playing && sound_fill >= SOUND_TARGET)
+                sound_playing = sound_played = true;
+            if (sound_playing) {
+                for (int k = 0; k < SOUND_PIECE; k++) {
+                    piece[2 * k] = sound_buffer[2 * sound_head];
+                    piece[2 * k + 1] = sound_buffer[2 * sound_head + 1];
+                    sound_head = (sound_head + 1) % SOUND_FRAMES;
+                }
+                sound_fill -= SOUND_PIECE;
+                level += sound_fill;
+                levels++;
+            } else {
+                memset(piece, 0, sizeof(piece));
+                if (sound_played)
+                    sound_silent += SOUND_PIECE;
+            }
+            double at = now_s();
+            if (at - since >= SOUND_PACE_S) {
+                if (levels > 0) {
+                    double mean = level / levels;
+                    double pace = 1 + SOUND_GAIN * (mean - SOUND_TARGET) / SOUND_TARGET;
+                    sound_pace = pace > 1 + SOUND_PACE ? 1 + SOUND_PACE
+                               : pace < 1 - SOUND_PACE ? 1 - SOUND_PACE : pace;
+                    sound_level = mean * 1000 / DEMOD_AUDIO_RATE;
+                }
+                level = 0, levels = 0;
+                since = at;
+            }
+            pthread_mutex_unlock(&sound_lock);
+            if (write_all(fd, piece, sizeof(piece)) < 0) {
+                pthread_mutex_lock(&sound_lock);
+                snprintf(sound_error, sizeof(sound_error), "/dev/pcm0: %s", strerror(errno));
+                while (sound_wanted)
+                    pthread_cond_wait(&sound_wake, &sound_lock);
+                pthread_mutex_unlock(&sound_lock);
+                break;
+            }
+        }
+        close(fd);                              /* (plays out the rest) */
+    }
+    return 0;
+}
+
 /* --- The FM demodulator's thread: every block in order --- */
 
 static void fm_values(void);
@@ -677,8 +832,8 @@ static void fm_publish(const struct spectrum *sp, double channel_rate, double hz
 /* While the FM window is open: every block through the demodulator, in
  * order (one missed, overwritten in the ring before it came to it, or a
  * change of the receiver, starts its discriminator again); the channel's
- * samples become the window's spectrum, the audio (D4: still unplayed)
- * is measured. The channel stays inside the span. */
+ * samples become the window's spectrum, the audio is measured and goes
+ * to the sound thread. The channel stays inside the span. */
 static void *fm_thread(void *arg)
 {
     (void)arg;
@@ -692,8 +847,8 @@ static void *fm_thread(void *arg)
     unsigned stream = 0;
     bool was_open = false;
     int filled = 0, loudest = 0;
-    double power = 0, start = now_s(), published = 0;
-    long channel = 0, frames = 0;
+    double power = 0, start = now_s(), published = 0, printed = 0;
+    long channel = 0;
     if (!sp)
         return 0;
     for (;;) {
@@ -716,6 +871,7 @@ static void *fm_thread(void *arg)
         pthread_mutex_lock(&lock);
         bool open = fm_win != 0;
         double hz = fm_hz, bandwidth = fm_bandwidth, volume = fm_volume;
+        double squelch = fm_squelch_on ? pow(10, fm_squelch / 10) : 0;
         if (open) {
             double inside = fm_inside(hz, b.lo, b.rate);
             if (inside != hz) {
@@ -742,8 +898,11 @@ static void *fm_thread(void *arg)
         if (reset) {                            /* (the window's reset: the measurements anew) */
             missed = 0;
             spectrum_reset(sp);
-            power = 0, channel = frames = 0, loudest = 0;
+            power = 0, channel = 0, loudest = 0;
             start = now_s();
+            pthread_mutex_lock(&sound_lock);
+            sound_silent = sound_dropped = 0;
+            pthread_mutex_unlock(&sound_lock);
         }
         if (!d || d_rate != b.rate) {
             demod_free(d);
@@ -759,12 +918,16 @@ static void *fm_thread(void *arg)
         stream = b.stream;
         demod_tune(d, hz - b.lo, bandwidth);
         demod_volume(d, volume);
+        demod_squelch(d, squelch);
+        pthread_mutex_lock(&sound_lock);
+        demod_pace(d, sound_pace);
+        pthread_mutex_unlock(&sound_lock);
         struct demod_out out = { .ci = ci, .cq = cq, .channel_max = CHANNEL_MAX,
                                  .audio = sound, .frames_max = CHANNEL_MAX };
         demod_run(d, b.iq, b.count, &out);
+        sound_put(sound, out.frames);
         power += out.power * out.channel;
         channel += out.channel;
-        frames += out.frames;
         for (int j = 0; j < out.frames; j++) {
             int a = sound[2 * j] < 0 ? -sound[2 * j] : sound[2 * j];
             if (a > loudest)
@@ -784,25 +947,49 @@ static void *fm_thread(void *arg)
             published = at;
         }
         if (at - start >= SHOW_S && channel > 0) {
+            pthread_mutex_lock(&sound_lock);
+            char sound_text[160];
+            if (sound_error[0])
+                snprintf(sound_text, sizeof(sound_text), "sound: %s", sound_error);
+            else if (sound_level < 0)
+                snprintf(sound_text, sizeof(sound_text), "sound starting");
+            else
+                snprintf(sound_text, sizeof(sound_text), "sound %.0f ms %+.3f%%", sound_level,
+                         (sound_pace - 1) * 100);
+            bool sound_failed = sound_error[0] != 0;
+            long silent = sound_silent, dropped = sound_dropped;
+            pthread_mutex_unlock(&sound_lock);
             pthread_mutex_lock(&lock);
             snprintf(fm_status, sizeof(fm_status),
-                     "narrow FM %+.3f kHz from the LO  channel %.0f/s (/%d)  audio %.0f/s",
-                     (hz - b.lo) / 1e3, demod_channel_rate(d), demod_decimation(d),
-                     (double)frames / (at - start));
-            fm_failed = lost > 0.01 || missed > 0;
-            int n = snprintf(fm_measure_line, sizeof(fm_measure_line),
-                             "level %.1f dBFS in the channel  audio peak %.1f dBFS",
-                             power_db(power / (double)channel),
-                             loudest > 0 ? 20 * log10(loudest / 32767.0) : -999.0);
+                     "narrow FM %+.3f kHz from the LO  channel %.0f/s (/%d)  %s",
+                     (hz - b.lo) / 1e3, demod_channel_rate(d), demod_decimation(d), sound_text);
+            fm_failed = lost > 0.01 || missed > 0 || sound_failed;
+            fm_level = power_db(power / (double)channel);
+            int n = demod_squelch_open(d)
+                  ? snprintf(fm_measure_line, sizeof(fm_measure_line),
+                             "level %.1f dBFS  audio peak %.1f dBFS", fm_level,
+                             loudest > 0 ? 20 * log10(loudest / 32767.0) : -999.0)
+                  : snprintf(fm_measure_line, sizeof(fm_measure_line),
+                             "level %.1f dBFS  squelch closed", fm_level);
             if (lost >= 0 && n > 0 && n < (int)sizeof(fm_measure_line))
                 n += snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
                               "  %.0f%% lost", 100 * lost);
             if (missed > 0 && n > 0 && n < (int)sizeof(fm_measure_line))
+                n += snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
+                              "  %lu blocks missed", missed);
+            if (silent > 0 && n > 0 && n < (int)sizeof(fm_measure_line))
+                n += snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
+                              "  %.1f s silent", (double)silent / DEMOD_AUDIO_RATE);
+            if (dropped > 0 && n > 0 && n < (int)sizeof(fm_measure_line))
                 snprintf(fm_measure_line + n, sizeof(fm_measure_line) - (size_t)n,
-                         "  %lu blocks missed", missed);
+                         "  %.1f s dropped", (double)dropped / DEMOD_AUDIO_RATE);
+            if (at - printed >= PRINT_S) {
+                printf("%s\n%s\n", fm_status, fm_measure_line);
+                printed = at;
+            }
             fm_redraw = true;
             pthread_mutex_unlock(&lock);
-            power = 0, channel = frames = 0, loudest = 0;
+            power = 0, channel = 0, loudest = 0;
             start = at;
         }
     }
@@ -983,8 +1170,10 @@ static struct range value_range(int k)
     }
     case VALUE_FM_BANDWIDTH:
         return (struct range){ true, FM_MIN_BANDWIDTH, 0, FM_MAX_BANDWIDTH };
-    default:
+    case VALUE_FM_VOLUME:
         return (struct range){ true, 0, 0, FM_MAX_VOLUME };
+    default:
+        return (struct range){ true, FM_MIN_SQUELCH, 0, FM_MAX_SQUELCH };
     }
 }
 
@@ -1004,8 +1193,10 @@ static double value_now(int k)
         return fm_hz;
     case VALUE_FM_BANDWIDTH:
         return fm_bandwidth;
-    default:
+    case VALUE_FM_VOLUME:
         return fm_volume;
+    default:
+        return fm_squelch;
     }
 }
 
@@ -1028,6 +1219,8 @@ static void describe(struct editor *e, int k, bool bad)
     if (r.known && n > 0 && n < (int)sizeof(e->hint))
         n += snprintf(e->hint + n, sizeof(e->hint) - (size_t)n, ", %.7g to %.7g", r.min / scale,
                       r.max / scale);
+    if (k == VALUE_FM_SQUELCH && n > 0 && n < (int)sizeof(e->hint))
+        n += snprintf(e->hint + n, sizeof(e->hint) - (size_t)n, " (empty or off: off)");
     if (n > 0 && n < (int)sizeof(e->hint))
         snprintf(e->hint + n, sizeof(e->hint) - (size_t)n, "   (Enter sets it, Esc gives up)");
     e->hint_bad = bad;
@@ -1039,7 +1232,9 @@ static void describe(struct editor *e, int k, bool bad)
 static void edit_value(struct editor *e, int k, bool empty)
 {
     char text[32] = "";
-    if (!empty) {
+    if (k == VALUE_FM_SQUELCH && !fm_squelch_on) {
+        snprintf(text, sizeof(text), "off");
+    } else if (!empty) {
         snprintf(text, sizeof(text), "%.6f", value_now(k) / VALUES[k].scale);
         char *end = text + strlen(text);        /* 2400.000000 -> 2400, 455.500000 -> 455.5 */
         while (end > text && end[-1] == '0')
@@ -1087,11 +1282,41 @@ static void fm_set_volume(double volume)
     fm_volume = volume < 0 ? 0 : volume > FM_MAX_VOLUME ? FM_MAX_VOLUME : volume;
 }
 
+/* The squelch on at db dBFS (clamped to its range). */
+static void fm_set_squelch(double db)
+{
+    fm_squelch = db < FM_MIN_SQUELCH ? FM_MIN_SQUELCH : db > FM_MAX_SQUELCH ? FM_MAX_SQUELCH : db;
+    fm_squelch_on = true;
+}
+
+/* s (dir 1) and S (-1): the squelch SQUELCH_STEP up or down; s turns it
+ * on SQUELCH_STEP over the channel's level (just closed on its hiss). */
+static void fm_step_squelch(int dir)
+{
+    if (!fm_squelch_on && dir > 0)
+        fm_set_squelch(round(fm_level) + SQUELCH_STEP);
+    else if (fm_squelch_on)
+        fm_set_squelch(fm_squelch + dir * SQUELCH_STEP);
+}
+
 /* The edit box's text as value k: asked of the receiver (or set for the
  * demodulator), or false (not a number, or outside the range: nothing
  * done). */
 static bool ask_value(int k, const char *text)
 {
+    if (k == VALUE_FM_SQUELCH) {                /* (empty or "off": off) */
+        const char *t = text;
+        while (*t == ' ')
+            t++;
+        if (!*t || !strncmp(t, "off", 3)) {
+            for (t += *t ? 3 : 0; *t == ' '; t++)
+                ;
+            if (!*t) {
+                fm_squelch_on = false;
+                return true;
+            }
+        }
+    }
     char *end;
     double typed = strtod(text, &end), v = typed * VALUES[k].scale;
     while (*end == ' ')
@@ -1120,8 +1345,11 @@ static bool ask_value(int k, const char *text)
     case VALUE_FM_BANDWIDTH:
         fm_bandwidth = v;
         break;
-    default:
+    case VALUE_FM_VOLUME:
         fm_set_volume(v);
+        break;
+    default:
+        fm_set_squelch(v);
     }
     return true;
 }
@@ -1188,8 +1416,8 @@ static double fm_inside(double hz, double lo, double rate)
     return hz > lo + half ? lo + half : hz < lo - half ? lo - half : hz;
 }
 
-/* The FM window's values line (its values 0-2: frequency, bandwidth,
- * volume) from what is asked now. */
+/* The FM window's values line (its values 0-3: frequency, bandwidth,
+ * volume, squelch) from what is asked now. */
 static void fm_values(void)
 {
     fm_values_line[0] = 0;
@@ -1199,6 +1427,11 @@ static void fm_values(void)
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 1, "%.2f kHz", fm_bandwidth / 1e3);
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  volume ");
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 2, "%.0f%%", fm_volume * 100);
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  squelch ");
+    if (fm_squelch_on)
+        append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 3, "%.0f dBFS", fm_squelch);
+    else
+        append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 3, "off");
     fm_redraw = true;
 }
 
@@ -1243,6 +1476,7 @@ static void fm_open(double hz)
         return;
     }
     pthread_detach(events);
+    sound_want(true);
     fm_shown.keys[0] = FM_KEYS[0];
     fm_shown.keys[1] = FM_KEYS[1];
     fm_shown.columns = 0;
@@ -1291,6 +1525,8 @@ static void *fm_events(void *arg)
                 fm_set_volume(fm_volume - VOLUME_STEP);
             } else if (ev.key == 'b' || ev.key == 'B') {
                 fm_step_bandwidth(ev.key == 'b' ? 1 : -1);
+            } else if (ev.key == 's' || ev.key == 'S') {
+                fm_step_squelch(ev.key == 's' ? 1 : -1);
             } else if (ev.key == 'm') {
                 fm_shown.show_hold = !fm_shown.show_hold;
             } else if (ev.key == 'r') {
@@ -1323,6 +1559,7 @@ static void *fm_events(void *arg)
         redraw = true;                          /* (the band in the main window) */
         pthread_mutex_unlock(&lock);
     }
+    sound_want(false);
     pthread_mutex_lock(&lock);
     window_field_free(fm_edit.field);
     fm_edit.field = 0;
@@ -1423,10 +1660,11 @@ int main(int argc, char **argv)
     redraw = true;
     printf("plutosa: started, connecting to %s\n", uri);
 
-    pthread_t acquirer, analyser, demodulator, drawer;
+    pthread_t acquirer, analyser, demodulator, player, drawer;
     if (pthread_create(&acquirer, 0, acquire_thread, 0) != 0 ||
         pthread_create(&analyser, 0, spectrum_thread, 0) != 0 ||
         pthread_create(&demodulator, 0, fm_thread, 0) != 0 ||
+        pthread_create(&player, 0, sound_thread, 0) != 0 ||
         pthread_create(&drawer, 0, draw_thread, 0) != 0) {
         printf("plutosa: cannot start a thread\n");
         return 1;
@@ -1434,6 +1672,7 @@ int main(int argc, char **argv)
     pthread_detach(acquirer);
     pthread_detach(analyser);
     pthread_detach(demodulator);
+    pthread_detach(player);
     pthread_detach(drawer);
     if (fm_start > 0) {
         pthread_mutex_lock(&lock);

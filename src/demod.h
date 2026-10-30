@@ -7,8 +7,8 @@
  *   filter   the channel: a low-pass at +-bandwidth / 2 (windowed sinc)
  *   FM       the phase step between samples: the frequency; 5 kHz of
  *            deviation is full scale
- *   audio    DC removed, a 4 kHz low-pass, resampled to 48 kHz, the
- *            volume, 16-bit stereo
+ *   audio    DC removed, a 4 kHz low-pass, the squelch, resampled to
+ *            48 kHz, the volume, 16-bit stereo
  *
  * The channel's samples before its filter come out too (for the FM
  * window's spectrum). One thread owns a demod; its state goes on across
@@ -17,6 +17,7 @@
 #ifndef PLUTOSA_DEMOD_H
 #define PLUTOSA_DEMOD_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define DEMOD_AUDIO_RATE  48000     /* audio samples per second */
@@ -38,6 +39,14 @@ void demod_tune(struct demod *d, double offset, double bandwidth);
 
 /* The audio's level: 1 makes DEMOD_DEVIATION full scale; 0 silence. */
 void demod_volume(struct demod *d, double volume);
+
+/* The squelch: the audio silent while the filtered channel's power
+ * (averaged over 5 ms; full scale 1, as demod_out's power) stays below
+ * `level` (0: off, as at the start). It opens above `level`, closes
+ * after 50 ms below half of it (3 dB of gap: no chatter near it), and the
+ * audio fades in and out over 5 ms (no click). */
+void demod_squelch(struct demod *d, double level);
+bool demod_squelch_open(const struct demod *d);
 
 /* The resampler's pace: 1 nominal; a little above 1 makes fewer audio
  * samples (for a sound card whose clock runs slow against the Pluto's). */

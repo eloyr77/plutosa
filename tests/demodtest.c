@@ -8,7 +8,9 @@
  * modulation (after the chain's known delays), with little distortion and
  * no DC even when the carrier is off by 300 Hz; blocks of any size the same
  * audio as one; 48000 audio frames a second (fewer with a pace above 1);
- * the volume, and clipping without wrapping. Built and run on the Mac
+ * the volume, and clipping without wrapping; the squelch open above its
+ * threshold and closed below, with its 3 dB gap, its 50 ms hold and its
+ * fade (no step in the audio a tone does not make itself). Built and run on the Mac
  * (make check) and on the RitterOS machine (make check-machine). Prints
  * PASS/FAIL lines; exits 1 if anything failed.
  */
@@ -67,14 +69,17 @@ static float channel_i[CHANNEL_MAX], channel_q[CHANNEL_MAX];
 static int frames, channels;
 static double last_power;
 
-/* `seconds` of the signal through d, in blocks cycling through `sizes`. */
-static void run(struct demod *d, const struct signal *s, double seconds, const int *sizes,
-                int count)
+static long position;               /* the signal's next sample */
+
+/* `seconds` more of the signal through d (from `position`, so the signal
+ * goes on without a jump), in blocks cycling through `sizes`. */
+static void run_on(struct demod *d, const struct signal *s, double seconds, const int *sizes,
+                   int count)
 {
     static int16_t iq[2 * CHUNK];
-    long total = lround(seconds * s->rate);
+    long total = position + lround(seconds * s->rate);
     frames = channels = 0;
-    for (long k0 = 0, c = 0; k0 < total; c++) {
+    for (long k0 = position, c = 0; k0 < total; c++) {
         int n = sizes[c % count];
         if (n > total - k0)
             n = (int)(total - k0);
@@ -91,6 +96,15 @@ static void run(struct demod *d, const struct signal *s, double seconds, const i
             last_power = out.power;
         k0 += n;
     }
+    position = total;
+}
+
+/* The same from the signal's start. */
+static void run(struct demod *d, const struct signal *s, double seconds, const int *sizes,
+                int count)
+{
+    position = 0;
+    run_on(d, s, seconds, sizes, count);
 }
 
 static const int ONE_SIZE[] = { CHUNK };
@@ -308,6 +322,95 @@ static void test_pace_volume(void)
     demod_free(d);
 }
 
+/* The loudest frame of the last run, from frame `from`. */
+static int loudest_from(int from)
+{
+    int loudest = 0;
+    for (int j = from; j < frames; j++)
+        loudest = audio[2 * j] > loudest ? audio[2 * j] : -audio[2 * j] > loudest ? -audio[2 * j]
+                                                                                 : loudest;
+    return loudest;
+}
+
+/* The largest step between frames of the last run (*previous: the frame
+ * before it, then its last). */
+static int largest_step(int *previous)
+{
+    int jump = 0;
+    for (int j = 0; j < frames; j++) {
+        int step = audio[2 * j] - *previous;
+        jump = step > jump ? step : -step > jump ? -step : jump;
+        *previous = audio[2 * j];
+    }
+    return jump;
+}
+
+static void test_squelch(void)
+{
+    /* The FM tone of test_fm: 1500 of 2048, a power of 0.536 (-2.7 dBFS)
+     * in the channel; its audio 16383 at most, its own largest step
+     * 16383 * 2 pi 1 kHz / 48 kHz = 2144. */
+    struct signal s = { 2.1e6, 250e3, 1500, 2500, 1000 }, none = s;
+    none.amp = 0;
+    double power = 1500.0 * 1500 / (2048.0 * 2048);
+    struct demod *d = demod_new(s.rate, s.offset, 12500);
+    check(demod_squelch_open(d), "squelch: open at the start (off)", demod_squelch_open(d), 1);
+    demod_squelch(d, power / 4);                    /* (6 dB under the signal) */
+    run(d, &s, 0.2, ONE_SIZE, 1);
+    check(loudest_from(DEMOD_AUDIO_RATE / 20) > 15000, "squelch 6 dB under the signal: its audio",
+          loudest_from(DEMOD_AUDIO_RATE / 20), 15000);
+    /* The threshold 6 dB over it: closed after the hold, fading out. */
+    int previous = audio[2 * (frames - 1)];
+    demod_squelch(d, power * 4);
+    run_on(d, &s, 0.2, ONE_SIZE, 1);
+    int jump = largest_step(&previous);
+    check(!demod_squelch_open(d), "squelch 6 dB over the signal: closed", demod_squelch_open(d), 0);
+    check(loudest_from(DEMOD_AUDIO_RATE / 10) == 0, "and silent (after 0.1 s)",
+          loudest_from(DEMOD_AUDIO_RATE / 10), 0);
+    check(loudest_from(DEMOD_AUDIO_RATE * 4 / 100) > 15000, "but not before the 50 ms hold",
+          loudest_from(DEMOD_AUDIO_RATE * 4 / 100), 15000);
+    check(jump < 2600, "closing: no step the tone does not make (fades out)", jump, 2600);
+    /* Down to 6 dB under it again: open, fading in. */
+    demod_squelch(d, power / 4);
+    run_on(d, &s, 0.1, ONE_SIZE, 1);
+    jump = largest_step(&previous);
+    check(demod_squelch_open(d), "squelch 6 dB under again: open", demod_squelch_open(d), 1);
+    check(jump < 2600, "opening: no step the tone does not make (fades in)", jump, 2600);
+    demod_free(d);
+
+    /* The gap: a threshold 2 dB over the signal (its closing point 1 dB
+     * under it) keeps it as it was, open or closed. */
+    d = demod_new(s.rate, s.offset, 12500);
+    demod_squelch(d, power * pow(10, 0.2));
+    run(d, &s, 0.3, ONE_SIZE, 1);
+    check(demod_squelch_open(d) && loudest_from(DEMOD_AUDIO_RATE / 5) > 15000,
+          "2 dB over the signal, open before: stays open", demod_squelch_open(d), 1);
+    demod_free(d);
+    d = demod_new(s.rate, s.offset, 12500);
+    demod_squelch(d, power * pow(10, 0.2));
+    run(d, &none, 0.1, ONE_SIZE, 1);               /* (nothing: it closes) */
+    run_on(d, &s, 0.3, ONE_SIZE, 1);
+    check(!demod_squelch_open(d) && loudest_from(0) == 0,
+          "2 dB over the signal, closed before: stays closed", demod_squelch_open(d), 0);
+    demod_free(d);
+
+    /* The hold: the signal gone, the level under the closing point after
+     * 5 ms * ln(0.536 / 0.05) = 12 ms; closed 50 ms later. */
+    d = demod_new(s.rate, s.offset, 12500);
+    demod_squelch(d, 0.1);
+    run(d, &s, 0.1, ONE_SIZE, 1);
+    run_on(d, &none, 0.04, ONE_SIZE, 1);
+    check(demod_squelch_open(d), "the signal gone 40 ms: still open (the hold)",
+          demod_squelch_open(d), 1);
+    run_on(d, &none, 0.04, ONE_SIZE, 1);
+    check(!demod_squelch_open(d), "gone 80 ms: closed", demod_squelch_open(d), 0);
+    /* Off again: open at once. */
+    demod_squelch(d, 0);
+    run_on(d, &none, 0.001, ONE_SIZE, 1);
+    check(demod_squelch_open(d), "squelch off: open", demod_squelch_open(d), 1);
+    demod_free(d);
+}
+
 /* Not a check: how much faster than the Pluto the demodulator runs (one
  * core; the signal made beforehand, only demod_run timed). */
 static void speed(double rate)
@@ -339,6 +442,7 @@ int main(void)
     test_fm();
     test_blocks();
     test_pace_volume();
+    test_squelch();
     speed(2.1e6);
     speed(5e6);
     if (failures) {
