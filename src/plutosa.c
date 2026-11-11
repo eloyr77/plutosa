@@ -1658,7 +1658,8 @@ int main(int argc, char **argv)
     shown.keys[0] = KEYS[0];
     shown.keys[1] = KEYS[1];
     redraw = true;
-    printf("plutosa: started, connecting to %s\n", uri);
+    printf("plutosa: started, connecting to %s (the FFT in %s)\n", uri,
+           spectrum_avx2(-1) ? "AVX2" : "plain C");
 
     pthread_t acquirer, analyser, demodulator, player, drawer;
     if (pthread_create(&acquirer, 0, acquire_thread, 0) != 0 ||

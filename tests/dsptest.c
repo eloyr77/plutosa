@@ -3,13 +3,18 @@
  * a plain DFT in double precision; each window's equivalent noise
  * bandwidth and scalloping loss against their published values; a tone's
  * level and bin; white noise's floor against sigma^2 * ENBW / n; the
- * average, max hold and peaks. Built and run on the Mac (make check).
- * Prints PASS/FAIL lines; exits 1 if anything failed.
+ * average, max hold and peaks. Where the processor has AVX2 and FMA (the
+ * laptop, not the Mac), the FFT's and the frame's checks run again with
+ * them, and both ways must agree on the same frames (with a speed line).
+ * Built and run on the Mac (make check) and the machine (make
+ * check-machine). Prints PASS/FAIL lines; exits 1 if anything failed.
  */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include "dsp.h"
 
 #ifndef M_PI
@@ -17,10 +22,11 @@
 #endif
 
 static int failures;
+static const char *way = "";        /* "AVX2: " while the checks run with it */
 
 static void check(int ok, const char *what, double got, double want)
 {
-    printf("%s  %s: %.4f (want %.4f)\n", ok ? "PASS" : "FAIL", what, got, want);
+    printf("%s  %s%s: %.4f (want %.4f)\n", ok ? "PASS" : "FAIL", way, what, got, want);
     if (!ok)
         failures++;
 }
@@ -63,7 +69,7 @@ static int bin_of(int n, int fft_bin)
 
 static void test_fft(void)
 {
-    static const int sizes[] = { 8, 64, 1024, 16384 };
+    static const int sizes[] = { 8, 16, 64, 1024, 16384 };
     for (unsigned t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
         int n = sizes[t];
         struct spectrum *s = spectrum_new(n, TAPER_HANN, 1);
@@ -241,13 +247,105 @@ static void test_columns_ticks(void)
     near("tick step for 1.2e-3", tick_step(1.2e-3), 2e-3, 1e-15);
 }
 
+/* The same frames through both ways: every bin of the FFT, and of the
+ * frame, average and max hold of spectrum_add, within float rounding. */
+static void test_same(void)
+{
+    static const int sizes[] = { 8, 16, 32, 4096, 65536 };
+    for (unsigned t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
+        int n = sizes[t];
+        size_t bytes = (size_t)n * sizeof(float);
+        float *i = malloc(bytes), *q = malloc(bytes), *re[2], *im[2], *got[2][3];
+        struct spectrum *s[2];
+        for (int way2 = 0; way2 < 2; way2++) {
+            re[way2] = malloc(bytes), im[way2] = malloc(bytes);
+            s[way2] = spectrum_new(n, TAPER_BLACKMAN_HARRIS, 4);
+        }
+        double fft_worst = 0, fft_largest = 0, worst[3] = { 0 }, largest[3] = { 0 };
+        for (int f = 0; f < 6; f++) {
+            for (int k = 0; k < n; k++) {
+                i[k] = (float)(2 * uniform() - 1);
+                q[k] = (float)(2 * uniform() - 1);
+            }
+            for (int way2 = 0; way2 < 2; way2++) {
+                spectrum_avx2(way2);
+                memcpy(re[way2], i, bytes);
+                memcpy(im[way2], q, bytes);
+                spectrum_fft(s[way2], re[way2], im[way2]);
+                spectrum_add(s[way2], i, q);
+                got[way2][0] = s[way2]->frame, got[way2][1] = s[way2]->average;
+                got[way2][2] = s[way2]->hold;
+            }
+            for (int k = 0; k < n; k++) {
+                fft_worst = fmax(fft_worst, hypot(re[1][k] - re[0][k], im[1][k] - im[0][k]));
+                fft_largest = fmax(fft_largest, hypot(re[0][k], im[0][k]));
+                for (int m = 0; m < 3; m++) {
+                    worst[m] = fmax(worst[m], fabs(got[1][m][k] - got[0][m][k]));
+                    largest[m] = fmax(largest[m], got[0][m][k]);
+                }
+            }
+        }
+        char what[96];
+        snprintf(what, sizeof(what), "%d points: the FFTs' largest difference / largest bin", n);
+        check(fft_worst / fft_largest < 2e-6, what, fft_worst / fft_largest, 0);
+        static const char *const NAMES[3] = { "frame", "average", "max hold" };
+        for (int m = 0; m < 3; m++) {
+            snprintf(what, sizeof(what), "%d points: the %s's largest difference / largest bin",
+                     n, NAMES[m]);
+            check(worst[m] / largest[m] < 5e-6, what, worst[m] / largest[m], 0);
+        }
+        for (int way2 = 0; way2 < 2; way2++) {
+            free(re[way2]), free(im[way2]);
+            spectrum_free(s[way2]);
+        }
+        free(i), free(q);
+    }
+}
+
+/* Not a check: spectrum_add's time for a frame of 4096, each way. */
+static void speed(void)
+{
+    int n = 4096, frames = 1000;
+    float *i = malloc((size_t)n * sizeof(float)), *q = malloc((size_t)n * sizeof(float));
+    for (int k = 0; k < n; k++)
+        i[k] = (float)(2 * uniform() - 1), q[k] = (float)(2 * uniform() - 1);
+    struct spectrum *s = spectrum_new(n, TAPER_BLACKMAN_HARRIS, 16);
+    for (int way2 = 0; way2 < 2; way2++) {
+        if (spectrum_avx2(way2) != way2)
+            continue;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int f = 0; f < frames; f++)
+            spectrum_add(s, i, q);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        printf("INFO  %s: %.1f us a frame of %d (%.0f frames a second)\n",
+               way2 ? "AVX2" : "plain C", secs * 1e6 / frames, n, frames / secs);
+    }
+    spectrum_free(s);
+    free(i), free(q);
+}
+
 int main(void)
 {
+    spectrum_avx2(0);
     test_fft();
     test_windows();
     test_noise();
     test_average_hold_peaks();
     test_columns_ticks();
+    if (spectrum_avx2(1)) {
+        way = "AVX2: ";
+        test_fft();
+        test_windows();
+        test_noise();
+        test_average_hold_peaks();
+        way = "";
+        test_same();
+    } else {
+        printf("INFO  no AVX2 and FMA here: the plain C only\n");
+    }
+    speed();
     if (failures) {
         printf("%d check(s) failed.\n", failures);
         return 1;

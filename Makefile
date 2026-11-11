@@ -4,7 +4,10 @@
 # the app's code there and run make there:
 #
 #   make HOST=root@ADDRESS           copy the code to REMOTE_DIR there and build it
-#   make deploy HOST=...             build and install it in /system/ARCH/apps
+#   make deploy HOST=...             build and install it in /system/ARCH/apps, as the
+#                                    bundle plutosa.program/ (the program, plutosa.info
+#                                    as info, plutosa.png as icon.png: the SDK's 42b)
+#   make upload HOST=...             install the last deployed program as it is
 #   make run HOST=... [ARGS=URI]     run it there (windowd must be running);
 #                                    another Pluto than ip:192.168.2.1 with ARGS
 #   make stop HOST=...               end it there
@@ -64,7 +67,7 @@ else
 # On another computer: only the app's code goes over, and make runs there.
 REMOTE_DIR ?= /home/root/plutosa
 ARCH ?= x86_64
-CODE := Makefile src tests libiio/include libiio/src
+CODE := Makefile $(APP).info $(APP).png src tests libiio/include libiio/src
 SSH  := ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(SSH_OPTS)
 need_host = $(if $(HOST),,$(error set HOST=user@address, e.g. make $@ HOST=root@192.168.0.195))
 
@@ -90,10 +93,17 @@ deploy: push
 # no build). The shared libraries stay compatible, so it runs on newer
 # systems too; on an older one ld.so may refuse it ("needs FUNCTION"):
 # make deploy then.
+# Installed as deploy does, the bundle $(APP).program/ with its info and
+# icon (from here), and an old flat apps/$(APP) from before bundles removed.
 upload:
 	$(need_host)
 	@test -f dist/$(ARCH)/$(APP) || { echo "no dist/$(ARCH)/$(APP): make deploy first"; exit 1; }
-	$(SSH) $(HOST) 'cat > /system/$(ARCH)/apps/$(APP).new && chmod 755 /system/$(ARCH)/apps/$(APP).new && mv /system/$(ARCH)/apps/$(APP).new /system/$(ARCH)/apps/$(APP)' < dist/$(ARCH)/$(APP)
+	rm -rf dist/stage && mkdir -p dist/stage/$(APP).program
+	cp dist/$(ARCH)/$(APP) dist/stage/$(APP).program/$(APP)
+	chmod 755 dist/stage/$(APP).program/$(APP)
+	cp $(APP).info dist/stage/$(APP).program/info
+	cp $(APP).png dist/stage/$(APP).program/icon.png
+	COPYFILE_DISABLE=1 tar cf - -C dist/stage $(APP).program | $(SSH) $(HOST) 'rm -f /system/$(ARCH)/apps/$(APP); tar xf - -C /system/$(ARCH)/apps'
 
 # A windowed app keeps the session open until its window closes: run it in
 # the background here.

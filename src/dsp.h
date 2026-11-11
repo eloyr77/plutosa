@@ -3,7 +3,10 @@
  * windowed FFT of complex samples, its power per bin scaled so that a
  * full-scale complex tone reads 0 dBFS whatever the window, averaging, max
  * hold, peaks and the noise floor. Plain C and math.h only, so
- * tests/dsptest.c checks it on the Mac too.
+ * tests/dsptest.c checks it on the Mac too; on x86 processors with AVX2
+ * and FMA the FFT and the frame's other loops are done 8 floats at a time
+ * (the plain C stays: elsewhere, and as the reference the tests hold it
+ * to).
  *
  * Samples come in full scales (the AD936x's 2048 is 1.0). Bins are kept
  * lowest frequency first: bin j is (j - n/2) * rate / n from the LO, so DC
@@ -27,6 +30,7 @@ struct spectrum {
     float *hold;                /* the highest power each bin had since the reset */
     /* the FFT's own */
     float *w, *cos_t, *sin_t, *re, *im;
+    float *twr, *twi;           /* stage by stage: e^(-pi i j / h) at h + j (AVX2's) */
     unsigned *rev;
     double scale;               /* 1 / (sum of w)^2 */
 };
@@ -43,6 +47,12 @@ void spectrum_add(struct spectrum *s, const float *i, const float *q);
 
 /* The FFT alone, in place (forward, unscaled, bins in FFT order). */
 void spectrum_fft(const struct spectrum *s, float *re, float *im);
+
+/* Whether spectrum_add and spectrum_fft use AVX2 and FMA: `use` 1 lets
+ * them where the processor has both (asked once), 0 keeps them to plain C
+ * (the tests compare the two), -1 changes nothing. The answer: whether
+ * they do now. */
+int spectrum_avx2(int use);
 
 /* The strongest local maxima of power (n bins), at least `guard` bins
  * apart, strongest first: their bins into bins[], at most max; the count. */

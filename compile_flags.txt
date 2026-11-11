@@ -5,3 +5,5 @@ x86_64-unknown-none-elf
 -Isrc
 -Ilibiio/include
 -std=c11
+-mavx2
+-mfma

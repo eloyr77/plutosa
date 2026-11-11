@@ -1,0 +1,3 @@
+# plutosa's app file (42b): installed as the bundle's info, the desktop menu lists it by name.
+name = Pluto spectrum analyzer
+about = spectrum, waterfall and narrow FM from an ADALM-Pluto
