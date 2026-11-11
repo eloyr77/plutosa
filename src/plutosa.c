@@ -123,9 +123,17 @@ static struct view *view;
 static const char *uri;
 static const char *picture_file;    /* -p FILE: the picture written there every PRINT_S */
 
-/* Shared by the threads, under the lock, which also covers drawing and
- * window_resize (it replaces the pixels drawn into). */
+/* Shared by the threads, under the lock, which also covers drawing into
+ * the windows' pixels (view_draw). It is never held while waiting for
+ * windowd or the disk: the FM thread takes it for every block, and a
+ * wait there runs the sound dry. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+/* The windows themselves: held by the drawing thread while it shows a
+ * picture (window_flush, which waits for windowd) or saves one (view_save,
+ * -p), and by the event threads while they change a window (the edit box,
+ * window_resize, which replaces the pixels, opening and closing the FM
+ * window). Taken before `lock`, never inside it. */
+static pthread_mutex_t draw_lock = PTHREAD_MUTEX_INITIALIZER;
 static char status[200] = "connecting...";
 static bool failed;
 static char settings_line[200], measure_line[200];
@@ -1004,7 +1012,11 @@ static void *draw_thread(void *arg)
     double saved = now_s();
     for (;;) {
         usleep(1000000 / PICTURES);
+        pthread_mutex_lock(&draw_lock);
         pthread_mutex_lock(&lock);
+        bool show = false, show_fm = false;
+        struct window *fm = fm_win;             /* (stays open: closing takes draw_lock) */
+        struct view *fmv = fm_view;
         if (fresh || redraw) {
             shown.lines[0] = main_edit.editing >= 0 ? main_edit.hint : status;
             shown.lines[1] = settings_line;
@@ -1015,7 +1027,7 @@ static void *draw_thread(void *arg)
             view_draw(view, &shown, fresh);
             if (main_edit.editing >= 0)
                 window_field_draw(main_edit.field);
-            window_flush(win);
+            show = true;
             fresh = redraw = false;
         }
         if (fm_win && (fm_fresh || fm_redraw)) {
@@ -1028,9 +1040,15 @@ static void *draw_thread(void *arg)
             view_draw(fm_view, &fm_shown, fm_fresh);
             if (fm_edit.editing >= 0)
                 window_field_draw(fm_edit.field);
-            window_flush(fm_win);
+            show_fm = true;
             fm_fresh = fm_redraw = false;
         }
+        pthread_mutex_unlock(&lock);
+        /* What waits for windowd or the disk, without `lock`. */
+        if (show)
+            window_flush(win);
+        if (show_fm)
+            window_flush(fm);
         if (picture_file && now_s() - saved >= PRINT_S) {
             if (view_save(view, picture_file) < 0)
                 printf("plutosa: cannot write %s: %s\n", picture_file, strerror(errno));
@@ -1040,11 +1058,11 @@ static void *draw_thread(void *arg)
             bool ppm = len > 4 && !strcmp(picture_file + len - 4, ".ppm");
             snprintf(fm_file, sizeof(fm_file), "%.*s-fm%s", (int)(ppm ? len - 4 : len),
                      picture_file, ppm ? ".ppm" : "");
-            if (fm_win && view_save(fm_view, fm_file) < 0)
+            if (fm && view_save(fmv, fm_file) < 0)
                 printf("plutosa: cannot write %s: %s\n", fm_file, strerror(errno));
             saved = now_s();
         }
-        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&draw_lock);
     }
     return 0;
 }
@@ -1423,7 +1441,10 @@ static void fm_values(void)
     fm_values_line[0] = 0;
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "frequency ");
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 0, "%.6f MHz", fm_hz / 1e6);
-    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  bandwidth ");
+    /* ("BW", as the main window's: at its longest, "frequency 6000.000000 MHz
+     * BW 20.00 kHz  volume 400%  squelch -130 dBFS", 71 characters, the line
+     * ends before the reset button at the 74th) */
+    append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  BW ");
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 1, "%.2f kHz", fm_bandwidth / 1e3);
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, -1, "  volume ");
     append(&fm_shown, fm_values_line, sizeof(fm_values_line), 1, 2, "%.0f%%", fm_volume * 100);
@@ -1499,6 +1520,7 @@ static void *fm_events(void *arg)
     int px = -1, py = -1;
     unsigned buttons = 0;
     while (window_wait(w, &ev) && ev.type != WINDOW_CLOSED) {
+        pthread_mutex_lock(&draw_lock);
         pthread_mutex_lock(&lock);
         double hz = 0;
         bool pressed = false;
@@ -1558,8 +1580,10 @@ static void *fm_events(void *arg)
         fm_values();
         redraw = true;                          /* (the band in the main window) */
         pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&draw_lock);
     }
     sound_want(false);
+    pthread_mutex_lock(&draw_lock);
     pthread_mutex_lock(&lock);
     window_field_free(fm_edit.field);
     fm_edit.field = 0;
@@ -1570,6 +1594,7 @@ static void *fm_events(void *arg)
     fm_win = 0;
     redraw = true;
     pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&draw_lock);
     return 0;
 }
 
@@ -1676,15 +1701,18 @@ int main(int argc, char **argv)
     pthread_detach(player);
     pthread_detach(drawer);
     if (fm_start > 0) {
+        pthread_mutex_lock(&draw_lock);
         pthread_mutex_lock(&lock);
         fm_open(fm_start);
         pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&draw_lock);
     }
 
     struct window_event ev;
     int px = -1, py = -1;               /* where the pointer is (the wheel's place) */
     unsigned buttons = 0;               /* held at the last pointer event */
     while (window_wait(win, &ev) && ev.type != WINDOW_CLOSED) {
+        pthread_mutex_lock(&draw_lock);
         pthread_mutex_lock(&lock);
         double hz = 0;
         bool pressed = false;           /* the left button, just now */
@@ -1739,9 +1767,11 @@ int main(int argc, char **argv)
         if (asked)
             __atomic_store_n(&pending, true, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&draw_lock);
     }
     /* Kept locked: the other threads must not draw into a closed window
      * before the program's end ends them too. */
+    pthread_mutex_lock(&draw_lock);
     pthread_mutex_lock(&lock);
     window_close(win);
     printf("plutosa: closed\n");
