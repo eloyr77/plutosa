@@ -50,6 +50,8 @@ xf - -C .sdk`.
 | `libiio/` | git submodule: eloyr77/ritteros-libiio (libiio 0.26's interface, iiod's network backend only); its sources are compiled into the program (`Makefile`'s `LIBIIO`) |
 | `plutosa.info`, `plutosa.png` | the bundle's app file (`name`, `about`: the desktop menu's label) and its 32x32 icon (the app's colours: a trace with a carrier and its max-hold mark over a waterfall), drawn 2026-11-10 by a small Python script (zlib only, 8x8 samples a pixel), not kept in the repo |
 | `compile_flags.txt` | include paths for the editor's clangd only (`.sdk/include`; the build is the machine's) |
+| `README.md` | for GitHub's page: what it does, what it needs, building, running, the keys, tests |
+| `screenshot.png` | the README's picture: the main window at 453 MHz, 5 MHz span (2026-11-11, the vivobook 192.168.0.251, taken in a headless windowd with `wsend` and `wshot`) |
 | `LICENSE` | GPL-3.0 (the user's choice, 2026-11-11, with the repo made public; ritteros-libiio the same) |
 | `reports/` | findings handed to other projects (e.g. the NCM link report for RitterOS's kernel) |
 
