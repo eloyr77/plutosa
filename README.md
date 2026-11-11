@@ -39,6 +39,12 @@ taken out of the full-rate stream, without changing the Pluto's settings.
 - Audio at 48 kHz through `/dev/pcm0`, kept in step with the sound card's
   clock.
 
+![the FM window at 453.3497 MHz: the channel's spectrum with the filter's band shaded, and its waterfall](screenshot-fm.png)
+
+*The FM window on a narrow FM channel at 453.3497 MHz: the carrier in the
+middle of the 12.5 kHz filter, and in the waterfall the sidebands of a
+transmission a moment before.*
+
 ## What it needs
 
 - A RitterOS machine (x86-64) with its window system (`windowd`) running,
