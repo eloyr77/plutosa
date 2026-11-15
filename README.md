@@ -1,6 +1,6 @@
-# plutosa
+# Plutosa
 
-<img src="plutosa.png" width="64" height="64" alt="plutosa's icon" align="right">
+<img src="Plutosa.png" width="64" height="64" alt="Plutosa's icon" align="right">
 
 A spectrum analyzer and narrow FM receiver for the
 [ADALM-Pluto](https://wiki.analog.com/university/tools/pluto),
@@ -10,7 +10,7 @@ It talks to the Pluto's `iiod` over its USB network link through
 of its signal processing itself, in plain C (with an AVX2 FFT where the
 processor has it).
 
-![plutosa at 453 MHz, 5 MHz span: the spectrum with its marker and the waterfall](screenshot.png)
+![Plutosa at 453 MHz, 5 MHz span: the spectrum with its marker and the waterfall](screenshot.png)
 
 *At 453 MHz with a 5 MHz span on a RitterOS laptop: every sample arrives
 (0% lost), 1238 FFTs of 4096 points a second.*
@@ -36,8 +36,10 @@ taken out of the full-rate stream, without changing the Pluto's settings.
 - Frequency (anywhere inside the span; a click on the main window's plot
   tunes it), bandwidth (1 to 20 kHz), volume, and a squelch (on the
   channel's level, in dBFS, or off).
-- Audio at 48 kHz through `/dev/pcm0`, kept in step with the sound card's
-  clock.
+- Audio at 48 kHz through RitterOS's sound server `soundd` (mixed with
+  other programs' sound, under the master volume), or straight to
+  `/dev/pcm0` when soundd is not running; kept in step with the sound
+  card's clock.
 
 ![the FM window at 453.3497 MHz: the channel's spectrum with the filter's band shaded, and its waterfall](screenshot-fm.png)
 
@@ -61,7 +63,7 @@ spectrum hardly notices and FM audio does.
 
 ## Building and installing
 
-plutosa is built on the RitterOS machine itself, with its own compiler and
+Plutosa is built on the RitterOS machine itself, with its own compiler and
 SDK. From another computer, the Makefile copies only the app's code there
 over ssh and runs `make` there:
 
@@ -72,8 +74,9 @@ make deploy HOST=root@ADDRESS SSH_OPTS="-i ~/.ssh/ritteros"
 ```
 
 That builds it and installs the app bundle
-`/system/x86_64/apps/plutosa.program/` (the program, its icon and its
-menu entry). RitterOS's sshd takes Ed25519 keys only; the SDK guide
+`/system/x86_64/apps/Plutosa.program/` (the program, its icon and its
+menu entry). A machine that had the app before it was renamed (lowercase
+`plutosa.program`) keeps the old bundle: delete it there. RitterOS's sshd takes Ed25519 keys only; the SDK guide
 (`sdk/CLAUDE.md` in RitterOS) tells how to install one.
 
 On the RitterOS machine itself, `make deploy` in a copy of this directory
@@ -85,9 +88,9 @@ Choose **Pluto spectrum analyzer** in the desktop menu (a right-click on
 the desktop), or in a terminal:
 
 ```sh
-plutosa                      # the Pluto at ip:192.168.2.1
-plutosa ip:192.168.2.1 -f 145.5   # with the FM window open at 145.5 MHz
-plutosa -p /tmp/view         # also writes both windows' pictures every 5 s (PPM)
+Plutosa                      # the Pluto at ip:192.168.2.1
+Plutosa ip:192.168.2.1 -f 145.5   # with the FM window open at 145.5 MHz
+Plutosa -p /tmp/view         # also writes both windows' pictures every 5 s (PPM)
 ```
 
 ### Keys

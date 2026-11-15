@@ -1,27 +1,36 @@
 # CLAUDE.md
 
-`plutosa`: a spectrum analyzer for the ADALM-Pluto, a windowed RitterOS app
-(runs under windowd, installed in `/system/<arch>/apps`).
+`Plutosa` (the repository and the source file `plutosa`): a spectrum
+analyzer for the ADALM-Pluto, a windowed RitterOS app (runs under
+windowd, installed as the bundle `/system/<arch>/apps/Plutosa.program/`).
+Renamed from `plutosa` on 2026-11-15 (the user's choice): since the SDK's
+69l an app's bundle and program start with a capital letter, compared
+exactly (`Owl.program/Owl`, typed `Owl`); and since 69l-2 the window
+titles too: `Plutosa` and `Plutosa FM` (`wsend wait "Plutosa FM"`).
 
 ## Building: on the RitterOS machine, never here
 
 The user's rules: only this app's code is ours. Never read, build in or
 use the local `~/ClaudeProjects/RitterOS` (the OS's own working tree) or
-anything of the kernel and drivers. The SDK is read from GitHub
-(`gh api repos/eloyr77/RitterOS/contents/sdk/CLAUDE.md -H "Accept:
-application/vnd.github.raw"`, likewise `sdk/API.md`, `sdk/ritteros.mk`),
+anything of the kernel and drivers. The SDK is read from GitHub, the
+developer repository (since 2026-11-15: `gh api
+repos/eloyr77/RitterOS-dev/contents/sdk/CLAUDE.md -H "Accept:
+application/vnd.github.raw"`, likewise `sdk/API.md`, `sdk/ritteros.mk`,
+and the manuals in `docs/`),
 and the app is built on the machine with its own `cc` and
 `/system/sdk/ritteros.mk` (the SDK's "Building on the machine"). From the
 Mac, `make`, `make deploy`, `make run`, `make stop`, `make check-machine`,
 `make check-radio` copy only the app's code (`Makefile`, `src/`, `tests/`,
-`libiio/include`, `libiio/src`, `plutosa.info`, `plutosa.png`) to
+`libiio/include`, `libiio/src`, `Plutosa.info`, `Plutosa.png`) to
 `/home/root/plutosa` with tar and run that target there over ssh (`HOST`,
 `SSH_OPTS`). Since the SDK's 42b a windowed app is a bundle: `make
 deploy` (the machine's `ritteros.mk`) installs
-`/system/x86_64/apps/plutosa.program/` with the program `plutosa`,
-`plutosa.info` as `info` and `plutosa.png` as `icon.png`, and removes a
-flat `apps/plutosa` from before bundles. It also brings the built program
-back to `dist/x86_64/plutosa` (git-ignored); `make upload` installs that
+`/system/x86_64/apps/Plutosa.program/` with the program `Plutosa`,
+`Plutosa.info` as `info` and `Plutosa.png` as `icon.png`, and removes a
+flat `apps/Plutosa` from before bundles (not the lowercase
+`plutosa.program` from before the rename: removed by hand on the
+vivobook, 2026-11-15). It also brings the built program back to
+`dist/x86_64/Plutosa` (git-ignored); `make upload` installs that
 file as it is, in the same bundle, for a fresh install (no sources, no
 build): the shared libraries stay compatible, so it runs on newer
 systems, while an older one may refuse it at the start ("needs FUNCTION":
@@ -30,6 +39,12 @@ RitterOS's grep then refused, so root too went through `sudo`; fixed the
 same day, 41h-9: it tells root with the shell's `case`, and grep has
 POSIX's `-q -s -x -F -e -f` since 68f. Recipes meant for any machine,
 also ones installed before, test with `case`, not `grep -q`.)
+`eloyr77/RitterOS` is now the public release snapshot ("RitterOS
+2026.11", 2026-11-11, no history), behind the developer repository
+`eloyr77/RitterOS-dev` (private, its full history): read the latter. On
+2026-11-15 the vivobook's `/system/sdk` was RitterOS-dev's up to 69l (69l-2,
+69m, 70a came after it was installed); the machine's manuals are
+`/system/doc` (`doc/commands/*.md`, `doc/manual.md`).
 `.sdk/include` (git-ignored) is a copy of the machine's `/system/include`
 for the editor's clangd only: `ssh HOST 'tar cf - -C /system include' | tar
 xf - -C .sdk`.
@@ -38,7 +53,7 @@ xf - -C .sdk`.
 
 | Path | What |
 |---|---|
-| `src/plutosa.c` | the app: the acquisition (only reads blocks into a ring), spectrum, FM demodulating, sound (`/dev/pcm0`), drawing and main threads, the FM window's events thread, the keys and mouse of both windows; `plutosa [URI] [-p FILE] [-f MHZ]` (-p: the pictures to FILE and FILE-fm as PPM every 5 s, to look at them from the Mac; -f: the FM window open at MHZ) |
+| `src/plutosa.c` | the app: the acquisition (only reads blocks into a ring), spectrum, FM demodulating, sound (soundd, else `/dev/pcm0`), drawing and main threads, the FM window's events thread, the keys and mouse of both windows; `Plutosa [URI] [-p FILE] [-f MHZ]` (-p: the pictures to FILE and FILE-fm as PPM every 5 s, to look at them from the Mac; -f: the FM window open at MHZ) |
 | `src/view.c`, `src/view.h` | the picture of either window: text with clickable values, spectrum with axes (MHz, or kHz from the middle), a shaded band, marker, waterfall, drawn in our own pixel buffer (wfont_text) and shown with one window_blit |
 | `src/radio.c`, `src/radio.h` | the receiver through libiio: settings, ranges, and the only writes the app makes (RX LO, rate, RF bandwidth, gain mode, gain) |
 | `src/dsp.c`, `src/dsp.h` | the spectrum's arithmetic (FFT, windows, dBFS, average, max hold, peaks, floor): plain C, no RitterOS calls; on x86 with AVX2 and FMA (asked once: CPUID, XGETBV) the FFT and the frame's loops in vectors of 8 floats (`spectrum_avx2`; the plain C the fallback and the reference) |
@@ -48,7 +63,7 @@ xf - -C .sdk`.
 | `tests/radiotest.c` | radio.c on the real Pluto: each receive setting changed, read back, clamped, then put back (`make check-radio`) |
 | `tests/streamtest.c` | how many of the Pluto's samples the link carries (refills only, per block size) and the rate they really come at (peaks moved by an LO step): `make measure ARGS="URI MSPS SECONDS KBUFS SIZES..."` |
 | `libiio/` | git submodule: eloyr77/ritteros-libiio (libiio 0.26's interface, iiod's network backend only); its sources are compiled into the program (`Makefile`'s `LIBIIO`) |
-| `plutosa.info`, `plutosa.png` | the bundle's app file (`name`, `about`: the desktop menu's label) and its 32x32 icon (the app's colours: a trace with a carrier and its max-hold mark over a waterfall), drawn 2026-11-10 by a small Python script (zlib only, 8x8 samples a pixel), not kept in the repo |
+| `Plutosa.info`, `Plutosa.png` | the bundle's app file (`name`, `about`: the desktop menu's label) and its 32x32 icon (the app's colours: a trace with a carrier and its max-hold mark over a waterfall), drawn 2026-11-10 by a small Python script (zlib only, 8x8 samples a pixel), not kept in the repo |
 | `compile_flags.txt` | include paths for the editor's clangd only (`.sdk/include`; the build is the machine's) |
 | `README.md` | for GitHub's page: what it does, what it needs, building, running, the keys, tests |
 | `screenshot.png` | the README's picture: the main window at 453 MHz, 5 MHz span (2026-11-11, the vivobook 192.168.0.251, taken in a headless windowd with `wsend` and `wshot`) |
@@ -75,13 +90,14 @@ xf - -C .sdk`.
 4. Display: spectrum trace, waterfall, axes, peak marker (`window_blit` of native pixels) (done 2026-10-27, seen through `-p`: 960x640, up to 25 pictures/s).
 5. Controls: center frequency, span, RF bandwidth, gain/AGC, reference level (done 2026-10-27; radiotest passes on the Pluto; tuning by typing was used at the laptop on 2026-10-29, the other keys and the mouse not yet confirmed). Values (2026-10-29): a click on LO, span, BW (settings line) or gain (the line below) opens the SDK's text field (`window_field_*`) over it, its present value selected: typed in MHz or dB, Enter sets it (refused, with the range in red, if not a number or outside the Pluto's `_available` range; the box stays open), Esc or a click elsewhere gives up; a typed BW stops following the span, a typed gain is manual. Typing a digit opens the LO's box. The drawing thread draws the field over each picture before window_flush (it is not in `-p`'s picture). Key bytes inside an escape sequence (an arrow's ESC [ B) are skipped: until then the down arrow also stepped the bandwidth (its B). Keys: arrows/wheel tune by span/10 and move the reference level by 10 dB, double-click centers, s/S span (2.5-56 MHz), b/B RF bandwidth (= span, 1-56 MHz), g gain mode, +/- manual gain by 3 dB, f/w/a FFT size/window/averaging, m max hold, r reset. Changes are applied between blocks, clamped to the `_available` ranges and read back; 4 blocks are thrown away after each (iiod's kernel buffers).
 
-FM demodulator (the user's plan of 2026-10-29): a second window `plutosa FM` (key `d`), its channel taken in software out of the full-rate stream (the user's choice: the main window keeps the full span; no decimation on the Pluto), a ±10 kHz spectrum of the channel, values frequency (inside the span), bandwidth (kHz), volume; audio to `/dev/pcm0` (48 kHz 16-bit stereo). Steps: D1 gap-free samples, D2 `src/demod.c` (mix, decimate to ~50 kHz, channel filter, discriminator, audio filter, resample, volume; tested on the Mac), D3 the window, D4 the sound. Names confirmed 2026-10-29: `src/demod.c`, `src/fmview.c`, `tests/demodtest.c`, key `d`, window `plutosa FM`. Squelch maybe later (D5).
+FM demodulator (the user's plan of 2026-10-29): a second window `plutosa FM` (key `d`; titled `Plutosa FM` since 2026-11-15), its channel taken in software out of the full-rate stream (the user's choice: the main window keeps the full span; no decimation on the Pluto), a ±10 kHz spectrum of the channel, values frequency (inside the span), bandwidth (kHz), volume; audio to `/dev/pcm0` (48 kHz 16-bit stereo). Steps: D1 gap-free samples, D2 `src/demod.c` (mix, decimate to ~50 kHz, channel filter, discriminator, audio filter, resample, volume; tested on the Mac), D3 the window, D4 the sound. Names confirmed 2026-10-29: `src/demod.c`, `src/fmview.c`, `tests/demodtest.c`, key `d`, window `plutosa FM`. Squelch maybe later (D5).
 
 - D1 (2026-10-29): the acquisition thread only reads blocks of 65536 into a ring of 4 (no lock the drawing holds: `pending` is atomic); the spectrum thread takes the newest. The loss (samples that came against rate x time, over 2 s) is shown: "1.88 MS/s (10% lost)". Result: the link itself is the limit, 8.0-8.3 MB/s (2.0-2.07 MS/s), just under the 2.083 MS/s (8.4 MB/s) the AD9361's lowest rate needs: 0-12% lost at 2.1 MS/s, in the app as with streamtest alone. Report for the kernel: `reports/2026-10-29-ncm-throughput.md` (half-full NTBs, one USB transfer per ACK). Until the link is faster, FM audio has small gaps even at the narrowest span. **The kernel was fixed the same day** (one ACK per ~7 segments now): streamtest 100.0% at 2.1, 3, 4 and 5 MS/s, 98.7% at 6, 75.5% at 8 (the link carries ~6 MS/s, 24 MB/s): spans up to 5 MHz are gap-free. After the kernel's TCP work (65e-29 delayed ACKs, 65e-35 a lock per connection), measured 2026-11-01: 100.0% at 5, 6 and 7 MS/s, 93.5% at 8 (7.48 came), 70.7% at 10 (7.07): the link carries ~7-7.5 MS/s (28-30 MB/s), spans up to 7 MHz are gap-free.
 - D2 (2026-10-29): `src/demod.c`; demodtest's 48 checks pass on the Mac (ASan/UBSan) and the laptop: tones at 1000.0000 Hz with the CIC's theoretical gain, stopband -97 dB, the FM tone within 0.1% and 0.0002 rad of the predicted delay, 0.09% distortion. Planted bugs caught: mixer sign 20, discriminator conjugate 3, a comb missing 20, resampler inverse 13, filter twice as wide 1, no DC removal 6, wrapping 2, pace ignored 1, state restarted each block 29/14/4 (resetting the oscillator's renormalization counter changes nothing: below the CIC's rounding). Speed with RitterOS's cc: 6x real time at 2.1 MS/s, 3.5x at 5 MS/s (one core).
 - D3 (2026-10-29): the FM window, `d` in the main window or `-f MHZ`. view.c draws it too (a shaded band and a kHz axis were all it needed: no fmview.c). The demodulating thread reads every block in order from the ring (counts those overwritten before it came to them: "blocks missed"), keeps the channel inside the span (an absolute frequency, pulled to the edge when the LO moves away), and makes the channel's samples (~50 kHz) a 2048-point spectrum, its middle +-10 kHz shown with the filter's band shaded. Values (click or type, like the main window's): frequency (MHz), bandwidth (kHz, 1-20; b/B steps 3-20), volume (%, 0-400, +/- 10; starts at 30%: FM's hiss without a signal is full scale at 100%). Arrows and wheel tune by 0.5 kHz and move the level, double-click tunes there; in the main window the channel is a shaded band and a click on the plot or waterfall tunes it there. The edit-box code is per window (`struct editor`). Seen through -p: a carrier at 450.7245 MHz at -18 dBFS in the channel, the waterfall with it. Buttons (the user's, 2026-10-29; view.c's `button`, at the right end of a text line): "FM demodulator" in the main window opens the FM window (as `d`); "reset" in the FM window (or `r` there) starts its measurements again (blocks missed, audio peak and level, the channel spectrum's average and max hold). Seen on the laptop: a narrow FM transmission at 453.3497 MHz, +-5 kHz of modulation, at a 5 MHz span with 0% lost. - D4 (2026-10-30): the sound. A sound thread (started at the start, waiting until the FM window is open) opens `/dev/pcm0` and writes 10 ms pieces (the write waits while the card's ring is full: the card's clock sets the pace); the FM thread puts its audio into our own buffer (0.5 s of room) and never waits for the card. The buffer is kept at 100 ms by the demodulator's pace (set each second from its mean level, 0.2% for a whole 100 ms off, at most +-0.5%): the Pluto's clock against the card's. Run dry (blocks lost), silence is written until it is at 100 ms again (counted: "N s silent" on the measure line, not the silence before the first sound); overflowing, the newest is dropped ("N s dropped"); the reset clears both. The status line shows "sound 80 ms -0.039%" (the buffer's mean level, the pace: the level sits under 100 ms as the blocks come in bursts), or why /dev/pcm0 refused (red). Heard on the laptop. No `soundd` runs there: the app owns pcm0 while the FM window is open.
 - D5 (2026-10-30, names the user's: value `squelch`, keys `s`/`S`, `demod_squelch`): a level squelch on the filtered channel's power (the measure line's "level", dBFS), averaged over 5 ms; it opens above the threshold, closes after 50 ms below 3 dB under it, the audio fades over 5 ms. The FM window's value "squelch -45 dBFS" or "off" (typed; empty or `off` turns it off; -130 to 0), `s` turns it on 3 dB over the present level (or raises it 3 dB), `S` lowers it. Closed, the measure line says "squelch closed" instead of the audio peak. In dBFS, so with AGC on a strong signal elsewhere in the span (gain down) can close it; manual gain keeps it put. 13 checks in demodtest (planted: no hold 3, no fade 2, no gap 1, gain unused 2, never reopening 1, starting closed 2, the level not the channel's 4).
 - Fixed 2026-11-11 (the user's "fix both bugs"): (1) "0.1 s silent" with nothing lost. The drawing thread held `lock` while it waited for windowd (`window_flush`) and the disk (`view_save`, -p: 76-84 ms every 5 s, measured), and the FM thread takes `lock` for every block: the sound ran dry. Now `draw_lock` (the windows: flush, save, the edit boxes, resize, opening and closing the FM window; always taken before `lock`) and `lock` only for drawing into the pixels; the FM, spectrum and acquisition threads never take `draw_lock`. Measured with an instrumented copy (not kept): no wait for `lock` over 20 ms through `-p` saves and `wshot`s; the silences left came each with "5% lost" in the same 2 s (the link's, twice in 2 minutes at 5 MS/s), which is what the count is for. (2) The FM window's values line ran under the reset button with the squelch on ("squelch -55 dBF"): "bandwidth" is "BW" there now, as in the main window (71 characters at the longest, the button at the 74th).
+- Sound through soundd (2026-11-15, the user's choice, after the SDK's 68w-68z): `soundd`, an elf on every machine now, mixes every program's sound (local socket `/run/sound`), under the master volume (`volume`); `/dev/pcm0` takes one program at a time, so plutosa holding it silenced the others, and a program playing through soundd made plutosa's open fail (EBUSY). The sound thread connects to `/run/sound` and sends `RSND`, then each 10 ms piece as a sound message (type 1, an 8-byte header: type, length, the machine's byte order) and asks its delay (type 2: soundd answers with the bytes of ours not yet heard, its mix and the device's buffer), waiting while that is over 80 ms (SOUND_AHEAD): soundd takes what it is sent at once, so the delay is what lets the card's clock set the pace, as /dev/pcm0's full ring did. Without soundd (no socket, or RSND not taken) it writes /dev/pcm0 as before. The pace and our 100 ms buffer are unchanged. A connection soundd closes (it refuses users not at the console) fails with EPIPE (no SIGPIPE on RitterOS) and shows as "sound: soundd: ..." until the FM window is opened again. The FM status line is now "FM +349.702 kHz from LO  channel 50.0 kS/s  sound 95 ms -0.010% via soundd" (or "via pcm0"; 78 characters at most: the decimation dropped from it). Built and installed; not yet heard or seen running (the user tests it).
 - The FPGA's decimation (measured, then left out at the user's word): `cf-ad9361-lpc` voltage0 `sampling_frequency` = rate / 8 switches it on (ADI's cf_axi_adc_core.c, receive only; the user OK'd writing it), but on Tezuka v0.3.21 the samples then come at rate / **20** (sample count and LO-step frequency scale agree), not the / 8 the driver reports.
 
 Later: offset tuning.

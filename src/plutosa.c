@@ -14,8 +14,8 @@
  * most PICTURES a second (view.c): the text, the spectrum with its marker,
  * the waterfall. While the FM window is open (key d), the FM thread
  * takes every block in order through the demodulator (demod.c) and the
- * sound thread plays its audio through /dev/pcm0; the FM window has an
- * events thread of its own.
+ * sound thread plays its audio through soundd (else /dev/pcm0); the FM
+ * window has an events thread of its own.
  * The main thread reads the window's events (the keys and the mouse, see
  * KEYS; a click on a value in the text opens the SDK's text field over it
  * to type a new one): changes to the receiver become a request that the
@@ -651,12 +651,16 @@ static void *spectrum_thread(void *arg)
     return 0;
 }
 
-/* --- The sound: the FM audio to /dev/pcm0 --- */
+/* --- The sound: the FM audio to soundd or /dev/pcm0 --- */
 
 /* The FM thread puts its audio into a buffer of our own and never waits
- * for the sound card; the sound thread writes it to /dev/pcm0 in pieces
- * (a write waits while the card's ring is full: the card's clock sets the
- * pace). The Pluto's clock and the card's differ a little, so the buffer
+ * for the sound card; the sound thread sends it on in pieces: to soundd
+ * (its socket SOUND_SOCKET, RSND messages: it mixes every program's sound,
+ * under the master volume), or, when soundd is not there, to /dev/pcm0
+ * itself. Either way the card's clock sets the pace: /dev/pcm0's write
+ * waits while the card's ring is full, and soundd is asked how much of
+ * ours is not yet heard, the thread waiting while it is over SOUND_AHEAD.
+ * The Pluto's clock and the card's differ a little, so the buffer
  * would fill up or run dry: the demodulator's resampler is paced to keep
  * it at SOUND_TARGET. Run dry (blocks lost), silence is written instead
  * (the card's ring never empties) until the buffer is at SOUND_TARGET
@@ -668,6 +672,10 @@ static void *spectrum_thread(void *arg)
 #define SOUND_PACE_S 1.0            /* the pace is set again this often */
 #define SOUND_GAIN   0.002          /* the pace's change for the buffer a whole SOUND_TARGET off */
 #define SOUND_PACE   0.005          /* the pace's furthest from 1 */
+#define SOUND_SOCKET "/run/sound"   /* soundd's (man soundd) */
+#define SOUND_AHEAD  3840           /* frames sent to soundd and not yet heard, at most: 80 ms */
+enum { RSND_SOUND = 1, RSND_DELAY = 2 };    /* soundd's message types */
+enum sound_via { VIA_NONE, VIA_SOUNDD, VIA_DEVICE };
 
 static pthread_mutex_t sound_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sound_wake = PTHREAD_COND_INITIALIZER;
@@ -678,7 +686,8 @@ static bool sound_playing;          /* (else silence until sound_fill reaches SO
 static bool sound_played;           /* since the window opened (silence before is no gap) */
 static double sound_pace = 1, sound_level = -1;   /* the level: ms in the buffer, -1 unknown */
 static long sound_silent, sound_dropped;          /* frames since the FM window's reset */
-static char sound_error[120];       /* /dev/pcm0 refused (empty: none) */
+static char sound_error[120];       /* soundd or /dev/pcm0 refused (empty: none) */
+static enum sound_via sound_via;    /* where the sound goes now */
 
 /* The FM window opened (true) or closed. */
 static void sound_want(bool on)
@@ -719,8 +728,59 @@ static int write_all(int fd, const void *p, size_t n)
     return 0;
 }
 
-/* While the FM window is open: /dev/pcm0 open, a piece written after
- * another, the pace set from the buffer's mean level. */
+static int read_all(int fd, void *p, size_t n)
+{
+    char *b = p;
+    while (n > 0) {
+        ssize_t r = read(fd, b, n);
+        if (r == 0)
+            errno = EPIPE;
+        if (r <= 0)
+            return -1;
+        b += r, n -= (size_t)r;
+    }
+    return 0;
+}
+
+/* Where the sound goes: soundd's socket (RSND sent), else /dev/pcm0. The
+ * descriptor (*via says which), or -1 with errno (/dev/pcm0's). */
+static int sound_open(enum sound_via *via)
+{
+    int fd = ritteros_local_connect(SOUND_SOCKET);
+    if (fd >= 0) {
+        if (write_all(fd, "RSND", 4) == 0) {
+            *via = VIA_SOUNDD;
+            return fd;
+        }
+        close(fd);
+    }
+    *via = VIA_DEVICE;
+    return open("/dev/pcm0", O_WRONLY);
+}
+
+/* One piece on its way: written to /dev/pcm0 (it waits while the card's
+ * ring is full), or sent to soundd as a sound message, then waiting while
+ * more than SOUND_AHEAD of ours is not yet heard. 0, or -1 with errno. */
+static int sound_send(int fd, enum sound_via via, const int16_t *piece, size_t bytes)
+{
+    if (via == VIA_DEVICE)
+        return write_all(fd, piece, bytes);
+    uint32_t head[2] = { RSND_SOUND, (uint32_t)bytes };
+    if (write_all(fd, head, sizeof(head)) < 0 || write_all(fd, piece, bytes) < 0)
+        return -1;
+    for (;;) {
+        uint32_t ask[2] = { RSND_DELAY, 0 }, delay;
+        if (write_all(fd, ask, sizeof(ask)) < 0 || read_all(fd, &delay, sizeof(delay)) < 0)
+            return -1;
+        long over = (long)(delay / 4) - SOUND_AHEAD;     /* frames (4 bytes each) */
+        if (over <= 0)
+            return 0;
+        usleep((useconds_t)(over * 1000000L / DEMOD_AUDIO_RATE) + 1000);
+    }
+}
+
+/* While the FM window is open: soundd or /dev/pcm0 open, a piece sent
+ * after another, the pace set from the buffer's mean level. */
 static void *sound_thread(void *arg)
 {
     (void)arg;
@@ -733,10 +793,14 @@ static void *sound_thread(void *arg)
         sound_playing = sound_played = false;
         sound_pace = 1, sound_level = -1;
         pthread_mutex_unlock(&sound_lock);
-        int fd = open("/dev/pcm0", O_WRONLY);
+        enum sound_via via;
+        int fd = sound_open(&via);
+        pthread_mutex_lock(&sound_lock);
+        sound_via = fd >= 0 ? via : VIA_NONE;
+        pthread_mutex_unlock(&sound_lock);
         if (fd < 0) {
             pthread_mutex_lock(&sound_lock);
-            snprintf(sound_error, sizeof(sound_error), "/dev/pcm0: %s", strerror(errno));
+            snprintf(sound_error, sizeof(sound_error), "pcm0: %s", strerror(errno));
             while (sound_wanted)                /* (tried again when the window opens again) */
                 pthread_cond_wait(&sound_wake, &sound_lock);
             pthread_mutex_unlock(&sound_lock);
@@ -782,9 +846,10 @@ static void *sound_thread(void *arg)
                 since = at;
             }
             pthread_mutex_unlock(&sound_lock);
-            if (write_all(fd, piece, sizeof(piece)) < 0) {
+            if (sound_send(fd, via, piece, sizeof(piece)) < 0) {
                 pthread_mutex_lock(&sound_lock);
-                snprintf(sound_error, sizeof(sound_error), "/dev/pcm0: %s", strerror(errno));
+                snprintf(sound_error, sizeof(sound_error), "%s: %s",
+                         via == VIA_SOUNDD ? "soundd" : "pcm0", strerror(errno));
                 while (sound_wanted)
                     pthread_cond_wait(&sound_wake, &sound_lock);
                 pthread_mutex_unlock(&sound_lock);
@@ -962,15 +1027,17 @@ static void *fm_thread(void *arg)
             else if (sound_level < 0)
                 snprintf(sound_text, sizeof(sound_text), "sound starting");
             else
-                snprintf(sound_text, sizeof(sound_text), "sound %.0f ms %+.3f%%", sound_level,
-                         (sound_pace - 1) * 100);
+                snprintf(sound_text, sizeof(sound_text), "sound %.0f ms %+.3f%% via %s",
+                         sound_level, (sound_pace - 1) * 100,
+                         sound_via == VIA_SOUNDD ? "soundd" : "pcm0");
             bool sound_failed = sound_error[0] != 0;
             long silent = sound_silent, dropped = sound_dropped;
             pthread_mutex_unlock(&sound_lock);
             pthread_mutex_lock(&lock);
-            snprintf(fm_status, sizeof(fm_status),
-                     "narrow FM %+.3f kHz from the LO  channel %.0f/s (/%d)  %s",
-                     (hz - b.lo) / 1e3, demod_channel_rate(d), demod_decimation(d), sound_text);
+            /* (80 characters at most, the window's width: "FM +28000.000 kHz from
+             * LO  channel 50.0 kS/s  sound 100 ms +0.500% via soundd" is 78) */
+            snprintf(fm_status, sizeof(fm_status), "FM %+.3f kHz from LO  channel %.1f kS/s  %s",
+                     (hz - b.lo) / 1e3, demod_channel_rate(d) / 1e3, sound_text);
             fm_failed = lost > 0.01 || missed > 0 || sound_failed;
             fm_level = power_db(power / (double)channel);
             int n = demod_squelch_open(d)
@@ -1470,7 +1537,7 @@ static void fm_open(double hz)
         fm_hz = shown.marker >= 0 ? shown.marker_hz : base_lo() + base_rate() / 4;
     if (connected)
         fm_hz = fm_inside(fm_hz, base_lo(), base_rate());
-    fm_win = window_open(FM_W, FM_H, "plutosa FM");
+    fm_win = window_open(FM_W, FM_H, "Plutosa FM");
     if (!fm_win) {
         snprintf(status, sizeof(status), "cannot open the FM window");
         failed = true;
@@ -1665,11 +1732,11 @@ int main(int argc, char **argv)
         } else if (argv[k][0] != '-') {
             uri = argv[k];
         } else {
-            printf("usage: plutosa [URI] [-p FILE] [-f MHZ]\n");
+            printf("usage: Plutosa [URI] [-p FILE] [-f MHZ]\n");
             return 2;
         }
     }
-    win = window_open(960, 640, "plutosa");
+    win = window_open(960, 640, "Plutosa");
     if (!win) {
         printf("plutosa: cannot open a window (is windowd running?)\n");
         return 1;

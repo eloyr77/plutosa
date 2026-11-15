@@ -1,12 +1,13 @@
-# plutosa: a spectrum analyzer for the ADALM-Pluto, a windowed RitterOS app
+# Plutosa: a spectrum analyzer for the ADALM-Pluto, a windowed RitterOS app
 # (KIND := apps). It is built on the RitterOS machine itself, with its own cc
 # and SDK (/system/sdk/ritteros.mk); from this computer the same targets copy
 # the app's code there and run make there:
 #
 #   make HOST=root@ADDRESS           copy the code to REMOTE_DIR there and build it
 #   make deploy HOST=...             build and install it in /system/ARCH/apps, as the
-#                                    bundle plutosa.program/ (the program, plutosa.info
-#                                    as info, plutosa.png as icon.png: the SDK's 42b)
+#                                    bundle Plutosa.program/ (the program, Plutosa.info
+#                                    as info, Plutosa.png as icon.png: the SDK's 42b;
+#                                    69l: an app's name starts with a capital)
 #   make upload HOST=...             install the last deployed program as it is
 #   make run HOST=... [ARGS=URI]     run it there (windowd must be running);
 #                                    another Pluto than ip:192.168.2.1 with ARGS
@@ -20,7 +21,7 @@
 # the environment. libiio comes from the submodule libiio/
 # (git submodule update --init); its sources are compiled into the program.
 
-APP      := plutosa
+APP      := Plutosa
 KIND     := apps
 LIBIIO   := libiio/src/iio.c libiio/src/iioxml.c libiio/src/iionet.c
 SRCS     := src/plutosa.c src/dsp.c src/demod.c src/radio.c src/view.c $(LIBIIO)
